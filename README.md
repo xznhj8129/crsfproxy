@@ -10,7 +10,7 @@ separate UDP port.
 ```bash
 
 # In one terminal (telemetry streamed raw to MWP on :40042)
-python crsfproxy.py --device /dev/ttyUSB0 --baud 115200 --host 0.0.0.0 --port 60000 --loop_hz 250 --tx_rate 100 --telemetry_udp 127.0.0.1:40042 --config_udp 60001
+python crsfproxy.py --device /dev/ttyUSB0 --baud 460800 --host 0.0.0.0 --port 60000 --loop_hz 250 --tx_rate 100 --telemetry_udp 127.0.0.1:40042 --config_udp 60001
 
 # MWP example (listen for UDP telemetry)
 mwp -d udp://:40042 -a
@@ -110,6 +110,11 @@ Replies return to the source address and source port of each request.
 
 ## Notes
 
+- `--baud 115200` uses the bootstrap speed directly. Any other requested baud
+  is negotiated after opening at 115200: the proxy sends the CRSF General
+  Speed Proposal command, validates the accepted response, and only then
+  changes the local serial baudrate, following the
+  [CRSF protocol specification](https://github.com/tbs-fpv/tbs-crsf-spec/blob/main/crsf.md).
 - On CP2102, 400-460K baud is buggy
 - ELRS hides packet rates that cannot fit over the configured handset baud.
   At 115200 baud the TX reports `Baud rate too low` and blanks rates such as
