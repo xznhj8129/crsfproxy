@@ -28,19 +28,14 @@ import queue
 import shlex
 import socket
 import struct
-import sys
 import threading
 import time
 import zlib
 from enum import IntEnum
-from pathlib import Path
 
 import serial
 
-ELRSTEST_ROOT = Path(__file__).resolve().parent.parent / "elrstest"
-sys.path.insert(0, str(ELRSTEST_ROOT))
-
-from elrstest.crsf import (  # noqa: E402
+from crsf_protocol import (
     CRSF_ADDRESS_ELRS_LUA,
     CRSF_ADDRESS_RADIO_TRANSMITTER,
     CRSF_ADDRESS_TRANSMITTER as ELRS_ADDRESS_TRANSMITTER,
@@ -51,7 +46,7 @@ from elrstest.crsf import (  # noqa: E402
     ParameterType,
     make_extended_frame,
 )
-from elrstest.link import ParameterClient  # noqa: E402
+from elrs_config import ParameterClient
 
 CRSF_SYNC = 0xC8
 CRSF_TRANSMITTER = 0xEE

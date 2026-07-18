@@ -30,8 +30,8 @@ ELRS transmitter's handset CRSF port.
 The transmitter supplies its live parameter names, types, choices, folders,
 information strings, and commands. The client therefore does not execute or
 parse a local Lua file; it speaks the same dynamic protocol that the proper
-ELRS Lua script uses. `crsfproxy` imports the verified protocol implementation
-from the repository's sibling `elrstest/` directory.
+ELRS Lua script uses. The CRSF codec and ELRS parameter client are included in
+this repository; no sibling checkout is required.
 
 One-shot examples:
 
