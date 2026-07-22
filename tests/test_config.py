@@ -13,33 +13,8 @@ from crsfproxy import (
     Parameter,
     ParameterType,
     ProxyConfigTransport,
-    crc8_command,
-    negotiate_serial_speed,
     parse_config_request,
 )
-
-
-class FakeSerial:
-    def __init__(self, response: bytes) -> None:
-        self.baudrate = 115200
-        self.response = bytearray(response)
-        self.writes = []
-
-    @property
-    def in_waiting(self) -> int:
-        return len(self.response)
-
-    def read(self, size: int) -> bytes:
-        data = bytes(self.response[:size])
-        del self.response[:size]
-        return data
-
-    def write(self, data: bytes) -> int:
-        self.writes.append(data)
-        return len(data)
-
-    def flush(self) -> None:
-        pass
 
 
 class FakeClient:
@@ -61,30 +36,6 @@ class FakeClient:
 
 
 class ConfigTests(unittest.TestCase):
-    def test_command_crc_matches_crsf_bind_vector(self) -> None:
-        self.assertEqual(crc8_command(bytes.fromhex("32ecc81001")), 0x9E)
-
-    def test_speed_negotiation_switches_after_accepted_response(self) -> None:
-        serial_port = FakeSerial(bytes.fromhex("ea0932eaee0a7100014cde"))
-        negotiate_serial_speed(serial_port, 460800)
-        self.assertEqual(
-            serial_port.writes,
-            [bytes.fromhex("c80c32eeea0a700000070800344b")],
-        )
-        self.assertEqual(serial_port.baudrate, 460800)
-
-    def test_speed_negotiation_does_not_switch_after_rejection(self) -> None:
-        serial_port = FakeSerial(bytes.fromhex("ea0932eaee0a710000f69a"))
-        with self.assertRaisesRegex(RuntimeError, "response=0"):
-            negotiate_serial_speed(serial_port, 460800)
-        self.assertEqual(serial_port.baudrate, 115200)
-
-    def test_speed_negotiation_rejects_bad_command_crc(self) -> None:
-        serial_port = FakeSerial(bytes.fromhex("ea0932eaee0a7100010094"))
-        with self.assertRaisesRegex(ValueError, "command_crc=0x00"):
-            negotiate_serial_speed(serial_port, 460800)
-        self.assertEqual(serial_port.baudrate, 115200)
-
     def test_shell_style_set_request_preserves_quoted_names(self) -> None:
         request = parse_config_request(
             b'set "Packet Rate" "333Hz Full(-105dBm)"')

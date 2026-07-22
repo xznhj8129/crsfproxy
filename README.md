@@ -43,7 +43,7 @@
 
 ```bash
 # Start the proxy (telemetry streamed raw to MWP on :40042)
-python crsfproxy.py --device /dev/ttyUSB0 --baud 460800 \
+python crsfproxy.py --device /dev/ttyUSB0 --baud 921600 \
     --host 0.0.0.0 --port 60000 \
     --loop_hz 250 --tx_rate 100 \
     --telemetry_udp 127.0.0.1:40042 --config_udp 60001
@@ -188,7 +188,7 @@ CRC32 covers the first 36 bytes.
 | Flag | Default | Description |
 |---|---|---|
 | `--device` | `/dev/ttyUSB0` | Serial device |
-| `--baud` | `115200` | Negotiated serial baudrate; startup is always 115200 |
+| `--baud` | `115200` | CRSF serial baudrate |
 | `--host` | `0.0.0.0` | UDP bind host for RC packets |
 | `--port` | `60000` | UDP port for RC packets |
 | `--tx_rate` | `100` | RC frame rate (Hz) |
@@ -207,9 +207,9 @@ Radio-link failsafe (TX↔RX loss) is handled by the receiver, not this proxy.
 
 ## 📝 Notes & gotchas
 
-- **Baud negotiation:** `--baud 115200` uses the bootstrap speed directly. Any other requested baud is negotiated after opening at 115200 — the proxy sends the CRSF General Speed Proposal command, validates the accepted response, and only then changes the local serial baudrate, per the [CRSF protocol specification](https://github.com/tbs-fpv/tbs-crsf-spec/blob/main/crsf.md).
+- **Baud startup:** The serial port opens directly at `--baud` and immediately streams RC frames. ExpressLRS detects the handset baud from that continuous CRSF traffic.
 - 🐛 On CP2102 adapters, 400–460K baud is buggy.
-- 📉 ELRS hides packet rates that can't fit over the configured handset baud. At 115200 the TX reports `Baud rate too low` and blanks rates such as 333 Hz and 500 Hz — use 460800 to expose the full high-rate table.
+- 📉 ELRS hides packet rates that can't fit over the configured handset baud. At 115200 the TX reports `Baud rate too low` and blanks rates such as 333 Hz and 500 Hz — use 921600 to expose the full high-rate table.
 
 > [!WARNING]
 > The configuration port has **no authentication**. Bind it to a trusted interface or restrict it with a firewall.

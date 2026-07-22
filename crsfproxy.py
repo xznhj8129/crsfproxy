@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Usage:
-  python crsfproxy.py --device /dev/ttyUSB0 --baud 460800 --host 0.0.0.0 --port 60000 --loop_hz 250 --tx_rate 100 --telemetry_udp 192.168.4.2:40042 --config_udp 60001
+  python crsfproxy.py --device /dev/ttyUSB0 --baud 921600 --host 0.0.0.0 --port 60000 --loop_hz 250 --tx_rate 100 --telemetry_udp 192.168.4.2:40042 --config_udp 60001
 
 CRSF TX side bridge:
 - Listens on a UDP port for 40-byte RC packets: <uint32 t_ms><16 x uint16 us><uint32 crc32>.
@@ -41,7 +41,6 @@ from crsf_protocol import (
     CRSF_ADDRESS_TRANSMITTER as ELRS_ADDRESS_TRANSMITTER,
     DeviceInfo,
     Frame as CrsfFrame,
-    FrameParser,
     FrameType,
     Parameter,
     ParameterType,
@@ -59,14 +58,7 @@ MID_US = 1500
 UDP_PAYLOAD_LEN = 4 + CHANNEL_COUNT * 2
 UDP_PACKET_LEN = UDP_PAYLOAD_LEN + 4
 WRITE_TIMEOUT_S = 0.1
-CRSF_BOOTSTRAP_BAUD = 115200
-DEFAULT_BAUD = CRSF_BOOTSTRAP_BAUD
-CRSF_COMMAND_CRC_POLYNOMIAL = 0xBA
-CRSF_COMMAND_GENERAL = 0x0A
-CRSF_SPEED_PROPOSAL = 0x70
-CRSF_SPEED_RESPONSE = 0x71
-CRSF_SPEED_PORT_ID = 0
-CRSF_SPEED_RESPONSE_TIMEOUT_S = 2.0
+DEFAULT_BAUD = 115200
 SERIAL_RX_HEADERS = (CRSF_SYNC, CRSF_TRANSMITTER)
 FAILSAFE_DEFAULT_US = [
     1500, 1500, 900, 1500, 900, 1500, 1500, 1500,
@@ -359,83 +351,6 @@ def crc8_data(data) -> int:
         crc = crc8_dvb_s2(crc, a)
     return crc
 
-def crc8_command(data: bytes) -> int:
-    crc = 0
-    for value in data:
-        crc ^= value
-        for _ in range(8):
-            if crc & 0x80:
-                crc = (crc << 1) ^ CRSF_COMMAND_CRC_POLYNOMIAL
-            else:
-                crc <<= 1
-        crc &= 0xFF
-    return crc
-
-def negotiate_serial_speed(serial_port, target_baud: int) -> None:
-    command = (
-        bytes([CRSF_COMMAND_GENERAL, CRSF_SPEED_PROPOSAL, CRSF_SPEED_PORT_ID])
-        + target_baud.to_bytes(4, "big")
-    )
-    command_crc = crc8_command(
-        bytes([
-            FrameType.COMMAND,
-            ELRS_ADDRESS_TRANSMITTER,
-            CRSF_ADDRESS_RADIO_TRANSMITTER,
-        ]) + command
-    )
-    proposal = make_extended_frame(
-        FrameType.COMMAND,
-        ELRS_ADDRESS_TRANSMITTER,
-        CRSF_ADDRESS_RADIO_TRANSMITTER,
-        command + bytes([command_crc]),
-    )
-    print(
-        f"CRSF speed proposal bootstrap_baud={serial_port.baudrate} "
-        f"target_baud={target_baud} port_id={CRSF_SPEED_PORT_ID} "
-        f"frame_hex={proposal.hex()}"
-    )
-    serial_port.write(proposal)
-    serial_port.flush()
-
-    parser = FrameParser()
-    deadline = time.monotonic() + CRSF_SPEED_RESPONSE_TIMEOUT_S
-    while time.monotonic() < deadline:
-        waiting = serial_port.in_waiting
-        if waiting:
-            for frame in parser.feed(serial_port.read(waiting)):
-                data = frame.extended_payload
-                if frame.type != FrameType.COMMAND \
-                        or frame.destination != CRSF_ADDRESS_RADIO_TRANSMITTER \
-                        or frame.origin != ELRS_ADDRESS_TRANSMITTER \
-                        or data[:3] != bytes([
-                            CRSF_COMMAND_GENERAL,
-                            CRSF_SPEED_RESPONSE,
-                            CRSF_SPEED_PORT_ID,
-                        ]):
-                    continue
-                if len(data) != 5:
-                    raise ValueError(
-                        f"CRSF speed response payload_len={len(data)} "
-                        f"payload_hex={data.hex()}")
-                expected_crc = crc8_command(bytes([frame.type]) + frame.payload[:-1])
-                if frame.payload[-1] != expected_crc:
-                    raise ValueError(
-                        f"CRSF speed response command_crc=0x{frame.payload[-1]:02X} "
-                        f"expected_crc=0x{expected_crc:02X} frame_hex={frame.raw.hex()}")
-                if data[3] != 1:
-                    raise RuntimeError(
-                        f"CRSF speed rejected target_baud={target_baud} "
-                        f"port_id={CRSF_SPEED_PORT_ID} response={data[3]}")
-                serial_port.baudrate = target_baud
-                print(
-                    f"CRSF speed accepted target_baud={target_baud} "
-                    f"port_id={CRSF_SPEED_PORT_ID} active_baud={serial_port.baudrate}")
-                return
-        time.sleep(0.001)
-    raise TimeoutError(
-        f"CRSF speed response timeout target_baud={target_baud} "
-        f"port_id={CRSF_SPEED_PORT_ID} timeout_seconds={CRSF_SPEED_RESPONSE_TIMEOUT_S}")
-
 def crsf_validate_frame(frame) -> bool:
     # frame = [0]sync [1]len [2]type ... [n]crc
     if len(frame) < 4:
@@ -633,7 +548,7 @@ def main():
     parser.add_argument('--host', default='0.0.0.0', required=False, help="UDP bind host for RC packets")
     parser.add_argument('--port', type=int, default=60000, required=False, help="UDP port for RC packets")
     parser.add_argument('--device', default='/dev/ttyUSB0', required=False, help="Serial device")
-    parser.add_argument('--baud', type=int, default=DEFAULT_BAUD, required=False, help="Negotiated serial baudrate; startup is always 115200")
+    parser.add_argument('--baud', type=int, default=DEFAULT_BAUD, required=False, help="CRSF serial baudrate")
     parser.add_argument('--tx_rate', type=float, default=100.0, help="RC frame rate Hz")
     parser.add_argument('--loop_hz', type=float, default=250.0, help="Max main loop rate Hz")
     parser.add_argument('--failsafe_time_ms', type=int, default=1000, help="Enter failsafe after this")
@@ -662,7 +577,7 @@ def main():
     # Open serial without asserting modem control lines during startup.
     ser = serial.Serial()
     ser.port = args.device
-    ser.baudrate = CRSF_BOOTSTRAP_BAUD
+    ser.baudrate = args.baud
     ser.timeout = 0
     ser.write_timeout = WRITE_TIMEOUT_S
     ser.bytesize = serial.EIGHTBITS
@@ -686,8 +601,6 @@ def main():
             f"rts={ser.rts} "
             f"dtr={ser.dtr}"
         )
-    if args.baud != CRSF_BOOTSTRAP_BAUD:
-        negotiate_serial_speed(ser, args.baud)
     input_buf = bytearray()
 
     # UDP socket for RC input
