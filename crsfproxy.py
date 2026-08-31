@@ -1,23 +1,15 @@
 #!/usr/bin/env python3
 """Unified UDP <-> CRSF proxy for ExpressLRS and mLRS radios.
 
-The RC bridge, telemetry forwarding, UDP configuration API, and failsafe behavior
-are shared. Select the radio-specific configuration backend with:
-
-  --radio elrs    ExpressLRS CRSF device-parameter protocol (default)
-  --radio mlrs    mLRS mBridge-over-CRSF protocol
-
-Normal defaults are intended to work without extra flags:
-
+Normal defaults:
   device      /dev/ttyUSB0
   baud        115200
   RC UDP      0.0.0.0:60000
   config UDP  RC port + 1 (60001 by default)
-  sys_id      1
   radio       elrs
 
-mLRS requires 400000 baud on the radio-side CRSF interface; when --radio mlrs
-is selected and --baud is omitted, the mLRS backend supplies that value.
+Use --radio mlrs for the mLRS mBridge configuration backend. mLRS defaults to
+400000 baud when --baud is omitted.
 """
 
 from __future__ import annotations
@@ -50,7 +42,6 @@ def _option_int(argv: list[str], option: str, default: int) -> int:
 
 
 def _apply_common_defaults(argv: list[str]) -> list[str]:
-    """Supply defaults that belong to the public crsfproxy interface."""
     if not any(
         arg == "--config_udp" or arg.startswith("--config_udp=")
         for arg in argv[1:]
@@ -78,7 +69,6 @@ def main() -> int:
             "Common defaults:\n"
             "  RC UDP         0.0.0.0:60000\n"
             "  config UDP     RC port + 1 (60001 by default)\n"
-            "  sys_id         1\n"
             "  device         /dev/ttyUSB0\n"
         )
 
