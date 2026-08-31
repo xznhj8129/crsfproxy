@@ -26,6 +26,7 @@ device      /dev/ttyUSB0
 baud        115200
 RC UDP      0.0.0.0:60000
 config UDP  RC port + 1 (60001 by default)
+RC hold     disabled
 radio       elrs
 ```
 
@@ -97,7 +98,21 @@ uint32 crc32
 
 The CRC32 covers the first 36 bytes: timestamp plus 16 channels.
 
-If RC updates stop, the proxy repeats the last valid channels until `--failsafe_time_ms` expires, then sends the configured failsafe channels. RF-link failsafe remains the receiver's job.
+### RC hold
+
+RC hold is **disabled by default**.
+
+With the default `--rc-hold-ms 0`, each fresh UDP RC sample is forwarded once, subject to `--tx_rate` as a maximum output rate. If the UDP RC source stops producing fresh samples, crsfproxy stops emitting CRSF RC channel frames. It does not generate substitute channel values and it does not implement a second aircraft failsafe policy.
+
+If you want to smooth very short UDP/input gaps, opt into a small hold window explicitly:
+
+```bash
+python3 crsfproxy.py --rc-hold-ms 80
+```
+
+During that window, crsfproxy may repeat the latest valid RC sample. Once the hold expires, it stops emitting RC frames until fresh UDP RC arrives again.
+
+Actual RF/receiver/flight-controller failsafe behavior remains entirely downstream of crsfproxy.
 
 ## Telemetry
 
@@ -206,9 +221,9 @@ No PTY or `socat` bridge is required.
 | `--baud` | `115200` | Serial baud; mLRS defaults to `400000` |
 | `--host` | `0.0.0.0` | UDP bind address |
 | `--port` | `60000` | RC input UDP port |
-| `--tx_rate` | `100` | CRSF RC frame rate |
+| `--tx_rate` | `100` | Maximum CRSF RC frame rate |
 | `--loop_hz` | `250` | Main loop ceiling |
-| `--failsafe_time_ms` | `1000` | RC silence before proxy failsafe |
+| `--rc-hold-ms` | `0` | Optional last-sample hold window; `0` disables it |
 | `--telemetry_udp` | off | Raw CRSF telemetry destination |
 | `--config_udp` | RC port + 1 | Radio configuration UDP port |
 | `--debug` | off | Verbose serial/RC/telemetry logging |

@@ -5,7 +5,7 @@ Usage:
 
 CRSF TX side bridge:
 - Listens on a UDP port for 40-byte RC packets: <uint32 t_ms><16 x uint16 us><uint32 crc32>.
-- Converts to CRSF RC_CHANNELS_PACKED and writes to the serial CRSF port at tx_rate.
+- Converts fresh UDP RC state to CRSF RC_CHANNELS_PACKED and writes it to the serial CRSF port.
 - Parses inbound CRSF telemetry and can forward raw frames to a UDP target (e.g. MWP).
 
 Telemetry output:
@@ -15,11 +15,11 @@ ELRS configuration:
 - Optional JSON or shell-style Lua configuration commands on --config_udp.
 - Configuration is TX-only and uses the same DEVICE/PARAMETER protocol as elrs.lua.
 
-Failsafe (proxy):
-- If RC updates stop for < failsafe_time_ms, repeat last_valid_channels_us.
-- If RC updates stop for >= failsafe_time_ms, send --failsafe_channels_us (defaults to throttle/arm low).
-- Radio link failsafe (TX<->RX loss) is handled by the receiver, not this proxy.
-- Failsafe channel values are configurable via --failsafe_channels_us.
+RC hold:
+- Disabled by default: each fresh UDP RC sample is forwarded once, subject to --tx_rate.
+- --rc-hold-ms N optionally repeats the latest RC sample for up to N ms to smooth short input gaps.
+- After the hold expires, crsfproxy stops emitting RC channel frames until fresh UDP RC arrives.
+- Actual RF/receiver/flight-controller failsafe logic remains downstream of crsfproxy.
 """
 
 import argparse
@@ -60,10 +60,6 @@ UDP_PACKET_LEN = UDP_PAYLOAD_LEN + 4
 WRITE_TIMEOUT_S = 0.1
 DEFAULT_BAUD = 115200
 SERIAL_RX_HEADERS = (CRSF_SYNC, CRSF_TRANSMITTER)
-FAILSAFE_DEFAULT_US = [
-    1500, 1500, 900, 1500, 900, 1500, 1500, 1500,
-    1500, 1500, 1500, 1500, 1500, 1500, 1500, 1500,
-]
 CONFIG_RESPONSE_LIMIT = 65507
 CONFIG_STATUS_INTERVAL_S = 1.0
 CONFIG_PARAMETER_TIMEOUT_S = 3.0
@@ -550,30 +546,27 @@ def main():
     parser.add_argument('--device', default='/dev/ttyUSB0', required=False,
                         help="Serial device or pySerial URL, e.g. socket://127.0.0.1:5762")
     parser.add_argument('--baud', type=int, default=DEFAULT_BAUD, required=False, help="CRSF serial baudrate")
-    parser.add_argument('--tx_rate', type=float, default=100.0, help="RC frame rate Hz")
+    parser.add_argument('--tx_rate', type=float, default=100.0, help="Maximum RC frame rate Hz")
     parser.add_argument('--loop_hz', type=float, default=250.0, help="Max main loop rate Hz")
-    parser.add_argument('--failsafe_time_ms', type=int, default=1000, help="Enter failsafe after this")
-    parser.add_argument('--failsafe_channels_us', nargs=CHANNEL_COUNT, type=int, default=FAILSAFE_DEFAULT_US, help="Failsafe channels in microseconds (16 values, space-separated)")
+    parser.add_argument('--rc-hold-ms', type=int, default=0, metavar='MS',
+                        help="Repeat the latest RC sample for up to MS after input stops; 0 disables hold (default)")
     parser.add_argument('--telemetry_udp', help="Send raw CRSF telemetry frames to udp://host:port (e.g. MWP)")
     parser.add_argument('--config_udp', type=int, help="UDP port for TX elrs.lua configuration commands")
     parser.add_argument('--debug', action='store_true', help="Verbose RC/telemetry logging")
     args = parser.parse_args()
+
+    if args.rc_hold_ms < 0:
+        parser.error('--rc-hold-ms must be >= 0')
 
     HOST = args.host
     PORT = args.port
     tx_rate = float(args.tx_rate)
     loop_hz = float(args.loop_hz)
     loop_period = 1.0 / loop_hz
-    failsafe_time_ms = int(args.failsafe_time_ms)
-
-    # RC channel state (microseconds). Initialize throttle and arm low.
-    channels_us = [MID_US] * CHANNEL_COUNT
-    channels_us[2] = MIN_US   # throttle
-    channels_us[4] = ARM_LOW_US   # arm
-
-    failsafe_us = list(args.failsafe_channels_us)
+    rc_hold_ms = int(args.rc_hold_ms)
 
     print(f"Listening for UDP RC on {HOST}:{PORT}")
+    print("RC hold disabled" if rc_hold_ms == 0 else f"RC hold {rc_hold_ms} ms")
 
     # Open a local serial device or pySerial URL without asserting modem control lines.
     ser = serial.serial_for_url(args.device, do_not_open=True)
@@ -636,6 +629,8 @@ def main():
     last_rc_update_t = 0.0
     last_tx_t = 0.0
     last_valid_channels_us = None
+    rc_update_seq = 0
+    last_sent_rc_seq = 0
     last_control_state = None
     last_tx_debug_t = 0.0
 
@@ -663,10 +658,10 @@ def main():
                 ch = list(struct.unpack_from("<16H", payload, 4))
                 if args.debug and sender != last_rc_sender:
                     print(f"Receiving RC from {sender} ch0-3={ch[:4]} ch4-7={ch[4:8]}")
-                channels_us = ch
                 last_valid_channels_us = ch
                 last_rc_update_t = now
                 last_rc_sender = sender
+                rc_update_seq += 1
 
             # Read from serial
             try:
@@ -782,7 +777,7 @@ def main():
                     elif ptype == "DEVICE_INFO":
                         print(f"TEL DEVICE_INFO {pkt['raw']}")
 
-            # Determine which channels to send
+            # Send fresh RC, or optionally hold the latest sample for a short gap.
             if (now - last_tx_t) >= (1.0 / tx_rate):
                 if config_transport is not None and now >= next_config_status_t:
                     config_transport.queue(make_extended_frame(
@@ -792,44 +787,53 @@ def main():
                         bytes([0, 0]),
                     ))
                     next_config_status_t = now + CONFIG_STATUS_INTERVAL_S
+
                 elapsed_ms = (now - last_rc_update_t) * 1000.0
+                active = None
                 if last_valid_channels_us is None:
-                    active = failsafe_us
-                    control_state = "no_rc"
-                elif elapsed_ms >= failsafe_time_ms:
-                    active = failsafe_us
-                    control_state = "failsafe"
-                else:
+                    control_state = 'waiting_rc'
+                elif rc_update_seq != last_sent_rc_seq:
                     active = last_valid_channels_us
-                    control_state = "live_rc"
+                    control_state = 'live_rc'
+                elif rc_hold_ms > 0 and elapsed_ms < rc_hold_ms:
+                    active = last_valid_channels_us
+                    control_state = 'rc_hold'
+                else:
+                    control_state = 'rc_idle'
+
                 if args.debug and control_state != last_control_state:
-                    print(
+                    line = (
                         f"RC state={control_state} "
                         f"sender={last_rc_sender} "
-                        f"elapsed_ms={elapsed_ms:.1f} "
-                        f"ch0-3={active[:4]} "
-                        f"ch4-7={active[4:8]}"
+                        f"elapsed_ms={elapsed_ms:.1f}"
                     )
+                    if active is not None:
+                        line += f" ch0-3={active[:4]} ch4-7={active[4:8]}"
+                    print(line)
                     last_control_state = control_state
+
                 if args.debug and (now - last_tx_debug_t) >= 0.5:
-                    print(
-                        f"Serial tx state={control_state} "
-                        f"elapsed_ms={elapsed_ms:.1f} "
-                        f"ch0-3={active[:4]} "
-                        f"ch4-7={active[4:8]}"
-                    )
+                    line = f"Serial tx state={control_state} elapsed_ms={elapsed_ms:.1f}"
+                    if active is not None:
+                        line += f" ch0-3={active[:4]} ch4-7={active[4:8]}"
+                    print(line)
                     last_tx_debug_t = now
+
+                rc_frame = channelsUsToPacket(active) if active is not None else b''
+                control_frames = config_transport.drain_outbound() \
+                    if config_transport is not None else []
+                burst = rc_frame + b''.join(control_frames)
                 try:
-                    frame = channelsUsToPacket(active)
-                    control_frames = config_transport.drain_outbound() \
-                        if config_transport is not None else []
-                    burst = frame + b"".join(control_frames)
-                    written = ser.write(burst)
+                    written = ser.write(burst) if burst else 0
+                    if rc_frame:
+                        last_sent_rc_seq = rc_update_seq
                     if args.debug:
+                        rc_type = f"0x{rc_frame[2]:02x}" if rc_frame else 'none'
                         print(
-                            f"Serial tx frame_len={len(frame)} control_frames={len(control_frames)} "
+                            f"Serial tx rc_frame_len={len(rc_frame)} control_frames={len(control_frames)} "
                             f"burst_len={len(burst)} written={written} "
-                            f"type=0x{frame[2]:02x} frame_hex={frame.hex()}"
+                            f"rc_type={rc_type}"
+                            + (f" frame_hex={rc_frame.hex()}" if rc_frame else '')
                         )
                 except serial.SerialTimeoutException as e:
                     print(f"Serial write timeout port={args.device} baud={args.baud} burst_len={len(burst)} elapsed_ms={elapsed_ms:.1f} err={e}")
