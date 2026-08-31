@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Remote ELRS Lua configuration client for crsfproxy.
 
-  python3 config_client.py --port 60001 info
-  python3 config_client.py --host radio.local --port 60001 get "Packet Rate"
+  python3 config_client.py --port 60001 --sys-id 1 info
+  python3 config_client.py --host radio.local --port 60001 --sys-id 2 get "Packet Rate"
   python3 config_client.py --host radio.local --port 60001 set "Packet Rate" "333Hz Full(-105dBm)"
   python3 config_client.py --host radio.local --port 60001 command Bind --confirm
   python3 config_client.py --host radio.local --port 60001 tui
@@ -12,26 +12,86 @@ import argparse
 import curses
 import json
 import socket
+import time
+
+from udp_mux import SYS_ID_BROADCAST, unwrap, validate_target_sys_id, wrap
 
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 60001
 DEFAULT_TIMEOUT_S = 60.0
+DEFAULT_BROADCAST_WAIT_S = 2.0
 UDP_RESPONSE_LIMIT = 65507
 WRITABLE_TYPES = {"UINT8", "INT8", "UINT16", "INT16", "UINT32", "INT32",
                   "UINT64", "INT64", "FLOAT", "SELECTION"}
 
 
-def udp_request(host: str, port: int, timeout: float, request: dict) -> dict:
+def _request_payload(sys_id: int, request: dict) -> bytes:
     payload = json.dumps(request, separators=(",", ":")).encode("utf-8")
+    return wrap(validate_target_sys_id(sys_id), payload)
+
+
+def _decode_response(response: bytes) -> tuple[int, dict]:
+    source_sys_id, payload = unwrap(response)
+    if source_sys_id == SYS_ID_BROADCAST:
+        raise ValueError("configuration response used reserved source sys_id 0")
+    return source_sys_id, json.loads(payload)
+
+
+def udp_request(host: str, port: int, timeout: float, sys_id: int, request: dict) -> dict:
+    target_sys_id = validate_target_sys_id(sys_id)
+    if target_sys_id == SYS_ID_BROADCAST:
+        raise ValueError("udp_request requires a specific sys_id; use udp_request_all for 0")
+    deadline = time.monotonic() + timeout
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-        sock.settimeout(timeout)
-        sock.sendto(payload, (host, port))
-        response, sender = sock.recvfrom(UDP_RESPONSE_LIMIT)
-    decoded = json.loads(response)
-    if not decoded["ok"]:
-        raise RuntimeError(f"proxy={sender[0]}:{sender[1]} error={decoded['error']}")
-    return decoded["result"]
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        sock.sendto(_request_payload(target_sys_id, request), (host, port))
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f"no configuration response from sys_id {target_sys_id}")
+            sock.settimeout(remaining)
+            try:
+                response, sender = sock.recvfrom(UDP_RESPONSE_LIMIT)
+            except socket.timeout as error:
+                raise TimeoutError(
+                    f"no configuration response from sys_id {target_sys_id}"
+                ) from error
+            source_sys_id, decoded = _decode_response(response)
+            if source_sys_id != target_sys_id:
+                continue
+            if not decoded["ok"]:
+                raise RuntimeError(
+                    f"proxy={sender[0]}:{sender[1]} sys_id={source_sys_id} "
+                    f"error={decoded['error']}"
+                )
+            return decoded["result"]
+
+
+def udp_request_all(host: str, port: int, timeout: float, broadcast_wait: float,
+                    request: dict) -> dict[int, dict]:
+    responses: dict[int, dict] = {}
+    first_deadline = time.monotonic() + timeout
+    quiet_deadline = None
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        sock.sendto(_request_payload(SYS_ID_BROADCAST, request), (host, port))
+        while True:
+            deadline = first_deadline if quiet_deadline is None else quiet_deadline
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            sock.settimeout(remaining)
+            try:
+                response, _sender = sock.recvfrom(UDP_RESPONSE_LIMIT)
+            except socket.timeout:
+                break
+            source_sys_id, decoded = _decode_response(response)
+            responses[source_sys_id] = decoded
+            quiet_deadline = time.monotonic() + broadcast_wait
+    if not responses:
+        raise TimeoutError("no configuration responses to broadcast sys_id 0")
+    return responses
 
 
 def print_result(result: dict) -> None:
@@ -126,15 +186,15 @@ def prompt_value(screen, parameter: dict) -> str:
     return value.decode("utf-8")
 
 
-def run_tui(screen, host: str, port: int, timeout: float) -> None:
+def run_tui(screen, host: str, port: int, timeout: float, sys_id: int) -> None:
     curses.curs_set(0)
     selected = 0
     status = ""
     parent_stack = [0]
     while True:
-        result = udp_request(host, port, timeout, {"command": "params"})
+        result = udp_request(host, port, timeout, sys_id, {"command": "params"})
         if "binding" not in result:
-            status_result = udp_request(host, port, timeout, {"command": "info"})
+            status_result = udp_request(host, port, timeout, sys_id, {"command": "info"})
             result["binding"] = status_result["binding"]
         all_parameters = result["parameters"]
         while True:
@@ -203,7 +263,7 @@ def run_tui(screen, host: str, port: int, timeout: float) -> None:
                     if value is None:
                         status = f"edit {parameter['name']!r} cancelled"
                         continue
-                    response = udp_request(host, port, timeout, {
+                    response = udp_request(host, port, timeout, sys_id, {
                         "command": "set",
                         "parameter": str(parameter["id"]),
                         "value": value,
@@ -215,7 +275,7 @@ def run_tui(screen, host: str, port: int, timeout: float) -> None:
                     break
                 if parameter["type"] in WRITABLE_TYPES:
                     value = prompt_value(screen, parameter)
-                    response = udp_request(host, port, timeout, {
+                    response = udp_request(host, port, timeout, sys_id, {
                         "command": "set",
                         "parameter": str(parameter["id"]),
                         "value": value,
@@ -232,7 +292,7 @@ def run_tui(screen, host: str, port: int, timeout: float) -> None:
                         f"Run {parameter['name']!r}? {parameter['command_info']} [y/N] ")
                     confirm = screen.getch() in (ord("y"), ord("Y"))
                     if confirm:
-                        udp_request(host, port, timeout, {
+                        udp_request(host, port, timeout, sys_id, {
                             "command": "command",
                             "parameter": str(parameter["id"]),
                             "confirm": True,
@@ -248,6 +308,10 @@ def main() -> int:
     parser.add_argument("--host", default=DEFAULT_HOST)
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_S)
+    parser.add_argument("--sys-id", "--sys_id", dest="sys_id", type=int, default=1,
+                        help="Target system ID: 0=all, 1..254=specific proxy")
+    parser.add_argument("--broadcast-wait", type=float, default=DEFAULT_BROADCAST_WAIT_S,
+                        help="Seconds of quiet after the last reply before broadcast collection ends")
     parser.add_argument("--json", action="store_true")
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("info")
@@ -263,9 +327,17 @@ def main() -> int:
     command_parser.add_argument("--confirm", action="store_true")
     commands.add_parser("tui")
     args = parser.parse_args()
+    try:
+        sys_id = validate_target_sys_id(args.sys_id)
+    except ValueError as error:
+        parser.error(str(error))
+    if args.broadcast_wait <= 0:
+        parser.error("--broadcast-wait must be greater than 0")
 
     if args.command == "tui":
-        curses.wrapper(run_tui, args.host, args.port, args.timeout)
+        if sys_id == SYS_ID_BROADCAST:
+            parser.error("tui requires --sys-id 1..254")
+        curses.wrapper(run_tui, args.host, args.port, args.timeout, sys_id)
         return 0
 
     request = {"command": args.command}
@@ -275,7 +347,27 @@ def main() -> int:
         request["value"] = args.value
     if hasattr(args, "confirm"):
         request["confirm"] = args.confirm
-    result = udp_request(args.host, args.port, args.timeout, request)
+    if sys_id == SYS_ID_BROADCAST:
+        responses = udp_request_all(
+            args.host, args.port, args.timeout, args.broadcast_wait, request)
+        if args.json:
+            print(json.dumps({str(key): value for key, value in sorted(responses.items())}, indent=2))
+        else:
+            for source_sys_id, response in sorted(responses.items()):
+                print(f"sys_id={source_sys_id}")
+                if response["ok"]:
+                    print_result(response["result"])
+                else:
+                    print(f"error={response['error']}")
+        for response in responses.values():
+            if not response["ok"]:
+                return 2
+            result = response["result"]
+            if "verified" in result and not result["verified"]:
+                return 2
+        return 0
+
+    result = udp_request(args.host, args.port, args.timeout, sys_id, request)
     if args.json:
         print(json.dumps(result, indent=2))
     else:

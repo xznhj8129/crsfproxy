@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """
 Usage:
-  python joystick_crsf.py --target 192.168.4.1 --port 60000 --rate 50 --joystick-index 0
+  python joystick_crsf.py --target 192.168.4.1 --port 60000 --sys-id 1 --rate 50
+  python joystick_crsf.py --target 192.168.4.1:60000 --target 192.168.4.2:60000 --sys-id 0
 
-Sends joystick channels as udp_crsf packets: <uint32 t_ms><16 x uint16 us><uint32 crc32>.
+Sends joystick channels as addressed UDP packets:
+<uint8 sys_id><uint32 t_ms><16 x uint16 us><uint32 crc32>.
 """
 
 import argparse
@@ -13,6 +15,8 @@ import time
 import zlib
 
 import pygame
+
+from udp_mux import validate_target_sys_id, wrap
 
 MIN_US = 900
 MAX_US = 2100
@@ -46,16 +50,43 @@ def get_joystick_state(joystick, min_axes):
     return axes[:min_axes], buttons[:BUTTON_COUNT]
 
 
+def parse_target(value: str, default_port: int) -> tuple[str, int]:
+    if not 1 <= default_port <= 65535:
+        raise ValueError("default UDP port must be 1..65535")
+    if value.count(":") > 1:
+        raise ValueError("IPv6 targets are not supported by joystick_crsf")
+    if ":" not in value:
+        if not value:
+            raise ValueError("target host cannot be empty")
+        return value, default_port
+    host, port_s = value.rsplit(":", 1)
+    if not host or not port_s.isdigit():
+        raise ValueError(f"invalid target {value!r}; expected host or host:port")
+    port = int(port_s)
+    if not 1 <= port <= 65535:
+        raise ValueError(f"target UDP port must be 1..65535: {value!r}")
+    return host, port
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--target", required=True, help="udp_crsf target host/IP")
-    parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="udp_crsf target port")
+    parser.add_argument("--target", action="append", required=True,
+                        help="UDP target host/IP or host:port; repeat for multiple proxies")
+    parser.add_argument("--port", type=int, default=DEFAULT_PORT,
+                        help="Default UDP target port when --target omits one")
+    parser.add_argument("--sys-id", "--sys_id", dest="sys_id", type=int, default=1,
+                        help="Target system ID: 0=all, 1..254=specific proxy")
     parser.add_argument("--rate", type=float, default=DEFAULT_RATE_HZ, help="Send rate in Hz")
     parser.add_argument("--joystick-index", type=int, default=0, help="Joystick index reported by pygame")
     parser.add_argument("--debugch", action="store_true", help="Print channels each send")
     args = parser.parse_args()
 
     period = 1.0 / args.rate
+    try:
+        sys_id = validate_target_sys_id(args.sys_id)
+        targets = [parse_target(value, args.port) for value in args.target]
+    except ValueError as error:
+        parser.error(str(error))
 
     pygame.init()
     pygame.joystick.init()
@@ -74,8 +105,8 @@ def main():
     required_axes = 8 if is_tx12 else AXIS_COUNT
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    target = (args.target, args.port)
-    print(f"Sending UDP RC to {target}.")
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    print(f"Sending UDP RC sys_id={sys_id} to {targets}.")
 
     channels = [MID_US] * 16
     channels[2] = MIN_US
@@ -125,8 +156,9 @@ def main():
                     dbg_t = now
             payload = struct.pack("<I16H", int(time.time() * 1000) & 0xFFFFFFFF, *channels)
             crc = zlib.crc32(payload) & 0xFFFFFFFF
-            packet = payload + struct.pack("<I", crc)
-            sock.sendto(packet, target)
+            packet = wrap(sys_id, payload + struct.pack("<I", crc))
+            for target in targets:
+                sock.sendto(packet, target)
 
             elapsed = time.time() - loop_start
             if elapsed < period:

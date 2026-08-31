@@ -4,12 +4,14 @@ Usage:
   python crsfproxy.py --device /dev/ttyUSB0 --baud 921600 --host 0.0.0.0 --port 60000 --loop_hz 250 --tx_rate 100 --telemetry_udp 192.168.4.2:40042 --config_udp 60001
 
 CRSF TX side bridge:
-- Listens on a UDP port for 40-byte RC packets: <uint32 t_ms><16 x uint16 us><uint32 crc32>.
+- Listens on UDP for addressed RC packets:
+  <uint8 sys_id><uint32 t_ms><16 x uint16 us><uint32 crc32>.
 - Converts to CRSF RC_CHANNELS_PACKED and writes to the serial CRSF port at tx_rate.
-- Parses inbound CRSF telemetry and can forward raw frames to a UDP target (e.g. MWP).
+- Parses inbound CRSF telemetry and can forward addressed frames to a UDP target.
 
 Telemetry output:
-- Optional raw CRSF frames to --telemetry_udp (host:port)
+- Optional addressed CRSF frames to --telemetry_udp (host:port):
+  <uint8 source_sys_id><raw CRSF frame>
 
 ELRS configuration:
 - Optional JSON or shell-style Lua configuration commands on --config_udp.
@@ -35,6 +37,7 @@ from enum import IntEnum
 
 import serial
 
+from udp_mux import accepts_sys_id, unwrap, validate_local_sys_id, wrap
 from crsf_protocol import (
     CRSF_ADDRESS_ELRS_LUA,
     CRSF_ADDRESS_RADIO_TRANSMITTER,
@@ -281,11 +284,12 @@ def parse_config_request(data: bytes) -> dict:
 
 
 class ConfigUdpServer(threading.Thread):
-    def __init__(self, host: str, port: int, transport: ProxyConfigTransport,
+    def __init__(self, host: str, port: int, sys_id: int, transport: ProxyConfigTransport,
                  debug: bool = False) -> None:
         super().__init__(name="config-udp", daemon=True)
         self.host = host
         self.port = port
+        self.sys_id = validate_local_sys_id(sys_id)
         self.transport = transport
         self.debug = debug
         self.stop_event = threading.Event()
@@ -302,7 +306,15 @@ class ConfigUdpServer(threading.Thread):
             except socket.timeout:
                 continue
             try:
-                request = parse_config_request(data)
+                target_sys_id, request_payload = unwrap(data)
+                if not accepts_sys_id(self.sys_id, target_sys_id):
+                    if self.debug:
+                        print(
+                            f"Ignoring config request sender={sender} "
+                            f"target_sys_id={target_sys_id} local_sys_id={self.sys_id}"
+                        )
+                    continue
+                request = parse_config_request(request_payload)
             except (UnicodeDecodeError, json.JSONDecodeError, ValueError, IndexError) as error:
                 response = {"ok": False, "error": f"{type(error).__name__}: {error}"}
             else:
@@ -313,7 +325,7 @@ class ConfigUdpServer(threading.Thread):
                 except (KeyError, ValueError, TimeoutError, RuntimeError) as error:
                     response = {"ok": False, "error": f"{type(error).__name__}: {error}"}
             payload = json.dumps(response, separators=(",", ":")).encode("utf-8")
-            self.socket.sendto(payload, sender)
+            self.socket.sendto(wrap(self.sys_id, payload), sender)
 
     def close(self) -> None:
         self.stop_event.set()
@@ -547,17 +559,24 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--host', default='0.0.0.0', required=False, help="UDP bind host for RC packets")
     parser.add_argument('--port', type=int, default=60000, required=False, help="UDP port for RC packets")
-    parser.add_argument('--device', default='/dev/ttyUSB0', required=False, help="Serial device")
+    parser.add_argument('--device', default='/dev/ttyUSB0', required=False,
+                        help="Serial device or pySerial URL, e.g. socket://127.0.0.1:5762")
+    parser.add_argument('--sys-id', '--sys_id', dest='sys_id', type=int, default=1,
+                        help="Local system ID: 1..254; incoming sys_id 0 addresses all proxies")
     parser.add_argument('--baud', type=int, default=DEFAULT_BAUD, required=False, help="CRSF serial baudrate")
     parser.add_argument('--tx_rate', type=float, default=100.0, help="RC frame rate Hz")
     parser.add_argument('--loop_hz', type=float, default=250.0, help="Max main loop rate Hz")
     parser.add_argument('--failsafe_time_ms', type=int, default=1000, help="Enter failsafe after this")
     parser.add_argument('--failsafe_channels_us', nargs=CHANNEL_COUNT, type=int, default=FAILSAFE_DEFAULT_US, help="Failsafe channels in microseconds (16 values, space-separated)")
-    parser.add_argument('--telemetry_udp', help="Send raw CRSF telemetry frames to udp://host:port (e.g. MWP)")
+    parser.add_argument('--telemetry_udp', help="Send sys_id-prefixed CRSF telemetry to host:port")
     parser.add_argument('--config_udp', type=int, help="UDP port for TX elrs.lua configuration commands")
     parser.add_argument('--debug', action='store_true', help="Verbose RC/telemetry logging")
     args = parser.parse_args()
 
+    try:
+        sys_id = validate_local_sys_id(args.sys_id)
+    except ValueError as error:
+        parser.error(str(error))
     HOST = args.host
     PORT = args.port
     tx_rate = float(args.tx_rate)
@@ -572,11 +591,10 @@ def main():
 
     failsafe_us = list(args.failsafe_channels_us)
 
-    print(f"Listening for UDP RC on {HOST}:{PORT}")
+    print(f"Listening for UDP RC on {HOST}:{PORT} sys_id={sys_id}")
 
-    # Open serial without asserting modem control lines during startup.
-    ser = serial.Serial()
-    ser.port = args.device
+    # Open a local serial device or pySerial URL without asserting modem control lines.
+    ser = serial.serial_for_url(args.device, do_not_open=True)
     ser.baudrate = args.baud
     ser.timeout = 0
     ser.write_timeout = WRITE_TIMEOUT_S
@@ -609,7 +627,7 @@ def main():
     rc_sock.bind((HOST, PORT))
     rc_sock.setblocking(False)
 
-    # Optional UDP socket for telemetry (raw CRSF frames)
+    # Optional UDP socket for telemetry, prefixed with this proxy's source sys_id.
     tele_sock = None
     tele_target = None
     if args.telemetry_udp is not None:
@@ -628,9 +646,13 @@ def main():
     next_config_status_t = 0.0
     if args.config_udp is not None:
         config_transport = ProxyConfigTransport()
-        config_server = ConfigUdpServer(HOST, args.config_udp, config_transport, args.debug)
+        config_server = ConfigUdpServer(
+            HOST, args.config_udp, sys_id, config_transport, args.debug)
         config_server.start()
-        print(f"ELRS configuration UDP listening on {HOST}:{args.config_udp}")
+        print(
+            f"ELRS configuration UDP listening on {HOST}:{args.config_udp} "
+            f"sys_id={sys_id}"
+        )
 
     last_rc_sender = None
     last_rc_update_t = 0.0
@@ -650,11 +672,23 @@ def main():
                     data, sender = rc_sock.recvfrom(128)
                 except (BlockingIOError, InterruptedError):
                     break
-                if len(data) != UDP_PACKET_LEN:
-                    print(f"Bad RC packet length {len(data)} from {sender}")
+                try:
+                    target_sys_id, rc_packet = unwrap(data)
+                except ValueError as error:
+                    print(f"Bad RC packet from {sender}: {error}")
                     continue
-                payload = data[:UDP_PAYLOAD_LEN]
-                crc_rx = struct.unpack_from("<I", data, UDP_PAYLOAD_LEN)[0]
+                if not accepts_sys_id(sys_id, target_sys_id):
+                    if args.debug:
+                        print(
+                            f"Ignoring RC from {sender} target_sys_id={target_sys_id} "
+                            f"local_sys_id={sys_id}"
+                        )
+                    continue
+                if len(rc_packet) != UDP_PACKET_LEN:
+                    print(f"Bad RC packet length {len(rc_packet)} from {sender}")
+                    continue
+                payload = rc_packet[:UDP_PAYLOAD_LEN]
+                crc_rx = struct.unpack_from("<I", rc_packet, UDP_PAYLOAD_LEN)[0]
                 crc_calc = zlib.crc32(payload) & 0xFFFFFFFF
                 if crc_calc != crc_rx:
                     print(f"CRC mismatch from {sender}: got {crc_rx:08x} expected {crc_calc:08x}")
@@ -753,9 +787,13 @@ def main():
                         CrsfFrame(frame[0], frame[2], frame[3:-1], frame))
                 if tele_sock is not None:
                     try:
-                        tele_sock.sendto(frame, tele_target)
+                        tele_packet = wrap(sys_id, frame)
+                        tele_sock.sendto(tele_packet, tele_target)
                         if args.debug:
-                            print(f"Sent telemetry frame len={len(frame)} type=0x{frame[2]:02x} to {tele_target}")
+                            print(
+                                f"Sent telemetry sys_id={sys_id} frame_len={len(frame)} "
+                                f"type=0x{frame[2]:02x} to {tele_target}"
+                            )
                     except BlockingIOError:
                         pass
                 pkt = handleCrsfPacket(frame[2], frame, verbose=args.debug)
