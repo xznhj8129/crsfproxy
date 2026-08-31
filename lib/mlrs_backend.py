@@ -31,8 +31,8 @@ from collections import deque
 from dataclasses import dataclass
 from enum import IntEnum
 
-import crsfproxy as base
-from crsf_protocol import (
+from . import elrs_backend as base
+from .crsf_protocol import (
     CRSF_ADDRESS_RADIO_TRANSMITTER,
     CRSF_ADDRESS_RECEIVER,
     CRSF_ADDRESS_TRANSMITTER,
@@ -878,9 +878,13 @@ def _apply_mlrs_defaults(argv: list[str]) -> None:
 _ORIGINAL_MAKE_EXTENDED_FRAME = base.make_extended_frame
 
 
-def main() -> int:
+def activate(argv: list[str]) -> None:
     _patch_crsfproxy()
-    _apply_mlrs_defaults(sys.argv)
+    _apply_mlrs_defaults(argv)
+
+
+def main() -> int:
+    activate(sys.argv)
     base.main()
     return 0
 

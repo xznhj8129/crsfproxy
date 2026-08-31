@@ -16,7 +16,7 @@ import zlib
 
 import pygame
 
-from udp_mux import validate_target_sys_id, wrap
+from lib import validate_target_sys_id, wrap
 
 MIN_US = 900
 MAX_US = 2100

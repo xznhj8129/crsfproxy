@@ -1,6 +1,6 @@
 import unittest
 
-from udp_mux import (
+from lib import (
     SYS_ID_BROADCAST,
     accepts_sys_id,
     unwrap,

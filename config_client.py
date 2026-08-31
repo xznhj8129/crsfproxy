@@ -14,7 +14,7 @@ import json
 import socket
 import time
 
-from udp_mux import SYS_ID_BROADCAST, unwrap, validate_target_sys_id, wrap
+from lib import SYS_ID_BROADCAST, unwrap, validate_target_sys_id, wrap
 
 
 DEFAULT_HOST = "127.0.0.1"

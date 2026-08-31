@@ -37,8 +37,8 @@ from enum import IntEnum
 
 import serial
 
-from udp_mux import accepts_sys_id, unwrap, validate_local_sys_id, wrap
-from crsf_protocol import (
+from .udp_mux import accepts_sys_id, unwrap, validate_local_sys_id, wrap
+from .crsf_protocol import (
     CRSF_ADDRESS_ELRS_LUA,
     CRSF_ADDRESS_RADIO_TRANSMITTER,
     CRSF_ADDRESS_TRANSMITTER as ELRS_ADDRESS_TRANSMITTER,
@@ -49,7 +49,7 @@ from crsf_protocol import (
     ParameterType,
     make_extended_frame,
 )
-from elrs_config import ParameterClient
+from .elrs_config import ParameterClient
 
 CRSF_SYNC = 0xC8
 CRSF_TRANSMITTER = 0xEE

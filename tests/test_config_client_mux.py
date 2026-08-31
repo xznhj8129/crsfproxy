@@ -2,7 +2,7 @@ import json
 import unittest
 
 import config_client
-from udp_mux import unwrap, wrap
+from lib import unwrap, wrap
 
 
 class ConfigClientMuxTests(unittest.TestCase):

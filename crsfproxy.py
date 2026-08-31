@@ -25,8 +25,7 @@ from __future__ import annotations
 import argparse
 import sys
 
-import _elrs_backend as _backend
-from _elrs_backend import *  # noqa: F401,F403 - preserve the historical import API
+from lib import elrs_backend, mlrs_backend
 
 
 RADIO_CHOICES = ("elrs", "mlrs")
@@ -68,19 +67,11 @@ def main() -> int:
             "  device         /dev/ttyUSB0\n"
         )
 
-    sys.argv[:] = forwarded
-
     if radio == "mlrs":
-        # _mlrs_backend was originally a thin mLRS frontend around crsfproxy.
-        # Point its historical `import crsfproxy as base` at the internal ELRS
-        # implementation, then let it replace only the radio-specific pieces.
-        sys.modules["crsfproxy"] = _backend
-        import _mlrs_backend as mlrs_backend
+        mlrs_backend.activate(forwarded)
 
-        mlrs_backend._patch_crsfproxy()
-        mlrs_backend._apply_mlrs_defaults(sys.argv)
-
-    _backend.main()
+    sys.argv[:] = forwarded
+    elrs_backend.main()
     return 0
 
 

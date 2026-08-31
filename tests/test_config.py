@@ -1,20 +1,13 @@
-import sys
 import unittest
-from pathlib import Path
 
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
-from crsfproxy import (
-    ConfigService,
-    CrsfFrame,
+from lib.crsf_protocol import (
     DeviceInfo,
+    Frame as CrsfFrame,
     FrameType,
     Parameter,
     ParameterType,
-    ProxyConfigTransport,
-    parse_config_request,
 )
+from lib.elrs_backend import ConfigService, ProxyConfigTransport, parse_config_request
 
 
 class FakeClient:

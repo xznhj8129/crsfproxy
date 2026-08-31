@@ -1,5 +1,5 @@
 """Usage:
-python js_test.py
+python3 tests/joystick_probe.py
 """
 
 import time

@@ -45,6 +45,39 @@ pip install pyserial
 pip install pygame  # only needed for joystick_crsf.py
 ```
 
+## Normal use
+
+The defaults are intended to work without launch-script archaeology:
+
+```text
+device      /dev/ttyUSB0
+baud        115200
+RC UDP      0.0.0.0:60000
+config UDP  0.0.0.0:60001
+sys_id      1
+radio       elrs
+```
+
+Start the proxy:
+
+```bash
+python3 crsfproxy.py
+```
+
+Send joystick RC to it:
+
+```bash
+python3 joystick_crsf.py --target localhost
+```
+
+Open the transmitter configuration UI:
+
+```bash
+python3 config_client.py tui
+```
+
+Flags are for changing those defaults, not enabling the normal features.
+
 ## System IDs and UDP addressing
 
 Every `crsfproxy` instance has a system ID:
@@ -80,15 +113,13 @@ A proxy accepts RC and configuration packets addressed to its own ID or to ID `0
 ExpressLRS is the default:
 
 ```bash
-python3 crsfproxy.py \
-    --radio elrs \
-    --sys-id 1 \
-    --device /dev/ttyUSB0 \
-    --baud 921600 \
-    --host 0.0.0.0 \
-    --port 60000 \
-    --telemetry_udp 127.0.0.1:40042 \
-    --config_udp 60001
+python3 crsfproxy.py
+```
+
+Use flags only when the hardware or network differs from the defaults. For example, an ELRS module that needs a higher handset baud can use:
+
+```bash
+python3 crsfproxy.py --baud 921600
 ```
 
 `--radio elrs` uses the standard CRSF device/parameter protocol used by `elrs.lua`: `DEVICE_INFO`, `PARAMETER_READ`, `PARAMETER_WRITE`, and CRSF commands. Parameter names, options, folders, and values are read live from the transmitter rather than hard-coded in `crsfproxy`.
@@ -98,14 +129,7 @@ ExpressLRS handset baud depends on the module and desired packet rates. `921600`
 ### mLRS
 
 ```bash
-python3 crsfproxy.py \
-    --radio mlrs \
-    --sys-id 2 \
-    --device /dev/ttyUSB0 \
-    --host 0.0.0.0 \
-    --port 60000 \
-    --telemetry_udp 127.0.0.1:40042 \
-    --config_udp 60001
+python3 crsfproxy.py --radio mlrs
 ```
 
 mLRS uses **400000 baud** on the radio-side CRSF interface. When `--radio mlrs` is selected and `--baud` is omitted, `crsfproxy` automatically uses `400000`.
@@ -115,7 +139,7 @@ mLRS configuration is not the standard CRSF parameter protocol. Its Lua configur
 mLRS parameter writes take effect immediately but are **not persistent until Save**:
 
 ```bash
-python3 config_client.py --port 60001 --sys-id 2 command Save --confirm
+python3 config_client.py command Save --confirm
 ```
 
 ## RC input
@@ -134,10 +158,7 @@ The CRC32 still covers only the original 36-byte RC payload: `t_ms` plus the 16 
 ### One proxy
 
 ```bash
-python3 joystick_crsf.py \
-    --target 127.0.0.1:60000 \
-    --sys-id 1 \
-    --rate 75
+python3 joystick_crsf.py --target 127.0.0.1
 ```
 
 ### Send the same controller state to several proxy servers
@@ -146,10 +167,9 @@ python3 joystick_crsf.py \
 
 ```bash
 python3 joystick_crsf.py \
-    --target 192.168.1.20:60000 \
-    --target 192.168.1.21:60000 \
-    --sys-id 0 \
-    --rate 75
+    --target 192.168.1.20 \
+    --target 192.168.1.21 \
+    --sys-id 0
 ```
 
 The RC packet is built once and sent unchanged to every target.
@@ -160,9 +180,8 @@ The joystick sender enables `SO_BROADCAST`, so one broadcast datagram can reach 
 
 ```bash
 python3 joystick_crsf.py \
-    --target 192.168.1.255:60000 \
-    --sys-id 0 \
-    --rate 75
+    --target 192.168.1.255 \
+    --sys-id 0
 ```
 
 To address only one proxy on that same broadcast network, use its specific ID instead of `0`.
@@ -171,23 +190,25 @@ If RC updates stop, the proxy repeats the last valid channels until `--failsafe_
 
 ## Configuration client
 
-`config_client.py` is radio-agnostic. Use `--sys-id` to select the proxy:
+`config_client.py` defaults to `127.0.0.1:60001` and system ID `1`:
 
 ```bash
-python3 config_client.py --port 60001 --sys-id 1 info
-python3 config_client.py --port 60001 --sys-id 1 devices
-python3 config_client.py --port 60001 --sys-id 2 params
-python3 config_client.py --port 60001 --sys-id 2 get "Packet Rate"
-python3 config_client.py --port 60001 --sys-id 2 set "RF Band" "2.4GHz"
-python3 config_client.py --port 60001 --sys-id 2 tui
+python3 config_client.py info
+python3 config_client.py devices
+python3 config_client.py params
+python3 config_client.py get "Packet Rate"
+python3 config_client.py set "RF Band" "2.4GHz"
+python3 config_client.py tui
 ```
+
+Use `--host`, `--port`, or `--sys-id` when selecting a different proxy.
 
 For mLRS, for example:
 
 ```bash
-python3 config_client.py --port 60001 --sys-id 2 get "Tx Ch Source"
-python3 config_client.py --port 60001 --sys-id 2 set "Tx Ch Source" crsf
-python3 config_client.py --port 60001 --sys-id 2 command Save --confirm
+python3 config_client.py get "Tx Ch Source"
+python3 config_client.py set "Tx Ch Source" crsf
+python3 config_client.py command Save --confirm
 ```
 
 Writes are read back for verification. Commands with side effects require `--confirm`.
@@ -199,7 +220,6 @@ System ID `0` sends one configuration request to all proxies that receive the UD
 ```bash
 python3 config_client.py \
     --host 192.168.1.255 \
-    --port 60001 \
     --sys-id 0 \
     info
 ```
@@ -237,20 +257,13 @@ Configure the selected INAV SITL UART as a normal serial receiver using CRSF. Th
 Example for UART3:
 
 ```bash
-python3 crsfproxy.py \
-    --sys-id 1 \
-    --device socket://127.0.0.1:5762 \
-    --host 127.0.0.1 \
-    --port 60000 \
-    --telemetry_udp 127.0.0.1:40042
+python3 crsfproxy.py --device socket://127.0.0.1:5762
 ```
 
 Then send RC input normally:
 
 ```bash
-python3 joystick_crsf.py \
-    --target 127.0.0.1:60000 \
-    --sys-id 1
+python3 joystick_crsf.py --target 127.0.0.1
 ```
 
 The path is:
@@ -289,29 +302,37 @@ The same `--device` option still accepts normal local devices such as `/dev/ttyU
 | `--loop_hz` | `250` | Main loop ceiling |
 | `--failsafe_time_ms` | `1000` | RC silence before proxy failsafe |
 | `--telemetry_udp` | off | Addressed CRSF telemetry destination |
-| `--config_udp` | off | Addressed radio configuration UDP port |
+| `--config_udp` | `60001` | Addressed radio configuration UDP port |
 | `--debug` | off | Verbose serial/RC/telemetry logging |
 
-## Internal layout
+## Repository layout
+
+The root Python files are the user-facing executables. Supporting code lives under `lib/`.
 
 ```text
-crsfproxy.py          public entry point and --radio selector
-_elrs_backend.py      shared proxy implementation + ExpressLRS config backend
-_mlrs_backend.py      mLRS mBridge-over-CRSF config backend
-elrs_config.py        standard CRSF parameter client used by ELRS
-crsf_protocol.py      CRSF framing and parameter codec
-udp_mux.py            one-byte system ID routing for UDP transports
-config_client.py      common addressed UDP configuration CLI/TUI
-joystick_crsf.py      joystick RC source with repeatable UDP targets
+crsfproxy.py          run the CRSF proxy
+joystick_crsf.py      send joystick RC to one or more proxies
+config_client.py      inspect and configure a transmitter
+
+lib/
+    __init__.py
+    elrs_backend.py   shared proxy implementation + ExpressLRS config backend
+    mlrs_backend.py   mLRS mBridge-over-CRSF config backend
+    elrs_config.py    standard CRSF parameter client used by ELRS
+    crsf_protocol.py  CRSF framing and parameter codec
+    udp_mux.py        one-byte system ID routing for UDP transports
+
+tests/
+    ...
 ```
 
-The underscore-prefixed backend modules are implementation details. Run `crsfproxy.py`.
+If a Python file is in the repository root, it is something a user runs.
 
 ## Notes
 
 - mLRS only supports 400K baud on its handset-side CRSF interface.
 - Some CP2102 USB serial adapters behave badly around 400-460K baud. If mLRS traffic is corrupt or unreliable, try another adapter or a direct UART.
-- `--config_udp` has no authentication. Bind it to a trusted interface or firewall it.
+- The configuration UDP interface has no authentication. Bind it to a trusted interface or firewall it.
 - System ID routing is intentionally simple. It provides addressing, not authentication or cryptographic identity.
 - ExpressLRS configuration has been exercised against ELRS 4.0.1.
 - mLRS support follows the current official mBridge protocol and Lua configurator behavior; hardware validation is still the next step.

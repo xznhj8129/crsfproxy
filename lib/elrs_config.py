@@ -23,7 +23,7 @@ from pathlib import Path
 
 import serial
 
-from crsf_protocol import (
+from .crsf_protocol import (
     CRSF_ADDRESS_BROADCAST,
     CRSF_ADDRESS_ELRS_LUA,
     CRSF_ADDRESS_FLIGHT_CONTROLLER,
