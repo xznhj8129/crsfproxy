@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import IntEnum
 
 from . import elrs_backend as base
@@ -35,6 +35,7 @@ from .crsf_protocol import (
     CRSF_ADDRESS_RADIO_TRANSMITTER,
     CRSF_ADDRESS_RECEIVER,
     CRSF_ADDRESS_TRANSMITTER,
+    CommandStatus,
     Frame,
     Parameter,
     ParameterType,
@@ -302,6 +303,7 @@ class MlrsClient:
         self.summary: MlrsSummary | None = None
         self.parameter_cache: list[MlrsParameterRecord] | None = None
         self.command_dead_until = 0.0
+        self.awaiting_confirmation: int | None = None  # synthetic command id that answered START
 
     def _wait_for_deadtime(self) -> None:
         delay = self.command_dead_until - time.monotonic()
@@ -726,18 +728,37 @@ class MlrsClient:
                 return MlrsWriteResult(updated, old_value, True)
         return MlrsWriteResult(updated, old_value, False)
 
-    def run_command(self, record: MlrsParameterRecord, confirm: bool) -> Parameter:
+    def command_step(self, record: MlrsParameterRecord, step: CommandStatus) -> Parameter:
+        """Answer the COMMAND steps (crsf_protocol.COMMAND_STEPS) for a synthetic command.
+
+        mLRS commands are single mBridge messages that finish at once, so the
+        ELRS flow maps onto them as: START asks for confirmation (like ELRS's
+        lcsAskConfirm, with the command's description as the prompt), CONFIRM
+        sends the command, CANCEL drops a pending one, POLL reports the state.
+        """
         if record.command is None or record.parameter.type != ParameterType.COMMAND:
             raise ValueError(f"mLRS parameter {record.parameter.name!r} is not a command")
-        if not confirm:
-            raise ValueError(f"command {record.parameter.name!r} requires --confirm")
-        self._queue_command(record.command)
-        self.transport.flush()
-        self.summary = None
-        self.parameter_cache = None
-        if record.command == MlrsCommand.PARAM_STORE:
-            self.command_dead_until = time.monotonic() + MLRS_SAVE_DEADTIME_S
-        return record.parameter
+        parameter_id = record.parameter.id
+        if step == CommandStatus.START:
+            self.awaiting_confirmation = parameter_id
+        elif step == CommandStatus.CONFIRM:
+            if self.awaiting_confirmation != parameter_id:
+                raise ValueError(f"command {record.parameter.name!r} is not awaiting confirmation; start it first")
+            self.awaiting_confirmation = None
+            self._queue_command(record.command)
+            self.transport.flush()
+            self.summary = None
+            self.parameter_cache = None
+            if record.command == MlrsCommand.PARAM_STORE:
+                self.command_dead_until = time.monotonic() + MLRS_SAVE_DEADTIME_S
+        elif step == CommandStatus.CANCEL:
+            if self.awaiting_confirmation == parameter_id:
+                self.awaiting_confirmation = None
+        elif step != CommandStatus.POLL:
+            raise ValueError(f"command step={step!r} is not a UI step")
+        status = (CommandStatus.CONFIRMATION_NEEDED if self.awaiting_confirmation == parameter_id
+                  else CommandStatus.READY)
+        return replace(record.parameter, command_status=status, command_timeout=0)
 
 
 class MlrsConfigService:
@@ -820,11 +841,10 @@ class MlrsConfigService:
                 "old_value": result.old_value,
                 "parameter": self._record_dict(updated_record),
                 "persisted": False,
-                "note": "Run command Save --confirm to persist mLRS parameter changes",
+                "note": "Run command Save to persist mLRS parameter changes",
             }
         if command == "command":
-            parameter = self.client.run_command(
-                record, bool(request.get("confirm", False)))
+            parameter = self.client.command_step(record, base.command_step_from_request(request))
             return {
                 "protocol": "mlrs",
                 "parameter": base.parameter_dict(parameter),

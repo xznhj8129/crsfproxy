@@ -228,7 +228,7 @@ python3 config_client.py --port 60011 info
 python3 config_client.py --host proxy-host --port 60001 info
 ```
 
-Writes are read back for verification. Commands with side effects require `--confirm`.
+Writes are read back for verification. `command` runs like `elrs.lua`: when the device asks for confirmation, its own prompt is shown on the terminal (`--confirm` answers yes), progress is printed while it runs, and Ctrl-C cancels it.
 
 ### Interactive TUI
 
@@ -244,10 +244,11 @@ A curses browser over the live parameter hierarchy read from the module, in your
 | <kbd>→</kbd> / <kbd>Enter</kbd> | Open folder · edit value · run command |
 | <kbd>←</kbd> / <kbd>Esc</kbd> | Back to parent (exits at root) |
 | <kbd>r</kbd> | Reload the table |
+| <kbd>Esc</kbd> (command popup) | Cancel the running command |
 
 Selection parameters get a choice list; numeric parameters get a text prompt and are **verified by reading them back**. Empty selection placeholders sent by ELRS are hidden without disturbing their underlying selection indices. A persistent banner shows the latest ELRS status message, connection state, flags, and good/bad packet counts.
 
-Commands (Bind, WiFi update, …) are polled until the module reports them finished, as `elrs.lua` does, however long the module keeps reporting progress; a command still running after 50 s is cancelled (the same cancel `elrs.lua` sends on RTN) and reported. A failed action is shown on the TUI status line.
+Commands (Bind, WiFi update, …) open a popup like `elrs.lua`'s: the device's own confirmation prompt (<kbd>y</kbd> confirms, any other key cancels), then its progress text with a spinner, polled at the interval the device asks for, for as long as it runs. <kbd>Esc</kbd> or <kbd>←</kbd> cancels a running command, as RTN does in `elrs.lua`. A failed action is shown on the TUI status line.
 
 <details>
 <summary><b>What <code>info</code> returns</b></summary>
@@ -278,7 +279,7 @@ devices
 params
 get "Packet Rate"
 set "Packet Rate" "333Hz Full(-105dBm)"
-command "Bind" --confirm
+command "Bind" start
 ```
 
 Every response is JSON:
@@ -286,6 +287,16 @@ Every response is JSON:
 ```json
 {"ok":true,"result":{"verified":true}}
 ```
+
+**Commands** are run one step per request, the way `elrs.lua` drives them (`COMMAND_STEPS` in `lib/crsf_protocol.py`): `{"command":"command","parameter":"Bind","step":"start"}`, with `step` one of `start`, `confirm`, `cancel`, `poll`. Each step is sent to the device once and answered with the parameter's new state (`command_status`, `command_timeout` in 10 ms units, `command_info`). After `start`:
+
+| `command_status` | Meaning | Next request |
+|---|---|---|
+| `0` READY | finished (or never started) | none |
+| `3` CONFIRMATION_NEEDED | `command_info` is the device's prompt | `confirm` or `cancel` |
+| anything else (`2` PROGRESS) | running, `command_info` is its progress text | `poll` after `command_timeout` × 10 ms, or `cancel` |
+
+The proxy never waits for a command to finish, so other configuration requests are served while one runs. mLRS commands (Save, Bind, …) answer the same steps: `start` asks for confirmation with the command's description, `confirm` sends it, `cancel` drops it.
 
 > [!IMPORTANT]
 > Only one configuration operation is processed at a time. Reads and writes can take several seconds — ELRS parameter entries are chunked and every write is read back for verification. There are **no automatic UDP retries**, because repeating a command like `Bind` can have side effects.

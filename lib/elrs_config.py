@@ -29,6 +29,7 @@ from .crsf_protocol import (
     CRSF_ADDRESS_FLIGHT_CONTROLLER,
     CRSF_ADDRESS_RADIO_TRANSMITTER,
     CRSF_ADDRESS_TRANSMITTER,
+    COMMAND_STEPS,
     CommandStatus,
     DeviceInfo,
     Frame,
@@ -322,17 +323,22 @@ class ParameterClient:
         return devices
 
     def _read_chunks(self, device_address: int, parameter_id: int,
-                     query_type: int, query_value: int | None = None) -> bytes:
+                     query_type: int, query_value: int | None = None,
+                     first_value: int | None = None) -> bytes:
+        """first_value, when given, replaces the value of the very first query only
+        (a COMMAND step, sent once); resends and later chunks use query_value."""
         origin = self.transport.origin(device_address)
         chunk = 0
         remaining = None
         assembled = bytearray()
         while True:
-            value = chunk if query_value is None else query_value
             deadline = time.monotonic() + self.timeout_seconds
             frame = None
             attempts = 0
             while frame is None and time.monotonic() < deadline:
+                value = chunk if query_value is None else query_value
+                if first_value is not None and chunk == 0 and attempts == 0:
+                    value = first_value
                 attempts += 1
                 self.transport.queue(make_extended_frame(
                     query_type, device_address, origin, bytes([parameter_id, value])))
@@ -394,45 +400,24 @@ class ParameterClient:
                 return WriteResult(updated, parameter.value, True)
         return WriteResult(updated, parameter.value, False)
 
-    def command(self, device_address: int, parameter: Parameter, confirm: bool,
-                run_limit_seconds: float) -> Parameter:
-        """Run a COMMAND parameter the way elrs.lua does.
+    def command_step(self, device_address: int, parameter: Parameter, step: CommandStatus) -> Parameter:
+        """Send one COMMAND step and return the device's resulting status.
 
-        Start it, confirm it if the device asks and confirm is set, then poll
-        for as long as the device reports PROGRESS. Each poll must be answered
-        within timeout_seconds. elrs.lua polls until the user cancels; without
-        a user, a command still running after run_limit_seconds is cancelled
-        (the lcsCancel elrs.lua sends on RTN) and reported as a timeout.
+        The UI runs the loop (see COMMAND_STEPS in crsf_protocol). The step is
+        sent once, as the first query of the read; START, CONFIRM and CANCEL
+        have side effects, so if the device does not answer within the resend
+        interval the read repeats POLL instead, which is safe to repeat. Each
+        step therefore draws one answer, not a stale extra one.
         """
         if parameter.type != ParameterType.COMMAND:
             raise ValueError(f"parameter={parameter.name!r} type={parameter.type.name} expected=COMMAND")
-        origin = self.transport.origin(device_address)
-
-        def send(step: CommandStatus) -> None:
-            self.transport.queue(make_extended_frame(FrameType.PARAMETER_WRITE, device_address, origin,
-                                                     bytes([parameter.id, step])))
-
-        send(CommandStatus.START)
-        run_deadline = time.monotonic() + run_limit_seconds
-        while True:
-            status = decode_parameter(
-                parameter.id,
-                self._read_chunks(device_address, parameter.id, FrameType.PARAMETER_WRITE,
-                                  query_value=CommandStatus.POLL))
-            if status.command_status == CommandStatus.READY:
-                return status
-            if status.command_status == CommandStatus.CONFIRMATION_NEEDED:
-                if not confirm:
-                    raise RuntimeError(
-                        f"parameter={parameter.name!r} needs confirmation: {status.command_info!r}")
-                send(CommandStatus.CONFIRM)
-            elif time.monotonic() >= run_deadline:
-                send(CommandStatus.CANCEL)
-                raise TimeoutError(
-                    f"device=0x{device_address:02X} command={parameter.name!r} "
-                    f"still_running_after_s={run_limit_seconds} status={status.command_status} "
-                    f"info={status.command_info!r} sent=CANCEL")
-            time.sleep((status.command_timeout or 10) / 100)
+        if step not in COMMAND_STEPS:
+            raise ValueError(f"command step={step!r} expected one of {sorted(s.name for s in COMMAND_STEPS)}")
+        self.transport.poll()  # drop late answers to earlier steps
+        return decode_parameter(
+            parameter.id,
+            self._read_chunks(device_address, parameter.id, FrameType.PARAMETER_WRITE,
+                              query_value=CommandStatus.POLL, first_value=step))
 
 
 def parameter_text(parameter: Parameter) -> str:

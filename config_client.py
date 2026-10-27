@@ -12,12 +12,16 @@ import argparse
 import curses
 import json
 import socket
+import time
+
+from lib.crsf_protocol import CommandStatus
 
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 60001
-DEFAULT_TIMEOUT_S = 60.0  # crsfproxy cancels a COMMAND still running after 50 s
+DEFAULT_TIMEOUT_S = 60.0
 UDP_RESPONSE_LIMIT = 65507
+SPINNER = "|/-\\"
 WRITABLE_TYPES = {"UINT8", "INT8", "UINT16", "INT16", "UINT32", "INT32",
                   "UINT64", "INT64", "FLOAT", "SELECTION"}
 
@@ -36,6 +40,21 @@ def udp_request(host: str, port: int, timeout: float, request: dict) -> dict:
     if not decoded["ok"]:
         raise ProxyError(f"proxy={sender[0]}:{sender[1]} error={decoded['error']}")
     return decoded["result"]
+
+
+def command_request(host: str, port: int, timeout: float, parameter: str,
+                    step: CommandStatus) -> dict:
+    """Send one COMMAND step (crsf_protocol.COMMAND_STEPS); returns the parameter's new state."""
+    return udp_request(host, port, timeout, {
+        "command": "command",
+        "parameter": parameter,
+        "step": step.name.lower(),
+    })["parameter"]
+
+
+def poll_delay_s(state: dict) -> float:
+    """Wait before the next POLL: the device's command_timeout, in 10 ms units (elrs.lua field.timeout)."""
+    return (state["command_timeout"] or 10) / 100
 
 
 def print_result(result: dict) -> None:
@@ -130,8 +149,53 @@ def prompt_value(screen, parameter: dict) -> str:
     return value.decode("utf-8")
 
 
+def draw_popup(screen, lines: list[str]) -> None:
+    screen.erase()
+    width = screen.getmaxyx()[1]
+    for row, text in enumerate(lines):
+        screen.addnstr(row, 0, text, width - 1, curses.A_BOLD if row == 0 else curses.A_NORMAL)
+    screen.refresh()
+
+
+def run_command_popup(screen, host: str, port: int, timeout: float, parameter: dict) -> str:
+    """Run a COMMAND like elrs.lua's popup; returns the status-line text.
+
+    Shows the device's own confirmation text and progress info, polls every
+    command_timeout, and sends CANCEL when the user presses Esc/Left (RTN in
+    elrs.lua) while it runs.
+    """
+    name = parameter["name"]
+    target = str(parameter["id"])
+    cancelled = False
+    spin = 0
+    state = command_request(host, port, timeout, target, CommandStatus.START)
+    while state["command_status"] != CommandStatus.READY:
+        if state["command_status"] == CommandStatus.CONFIRMATION_NEEDED:
+            draw_popup(screen, [name, state["command_info"], "", "[y] confirm   [any other key] cancel"])
+            step = CommandStatus.CONFIRM if screen.getch() in (ord("y"), ord("Y")) else CommandStatus.CANCEL
+            cancelled = step == CommandStatus.CANCEL
+            state = command_request(host, port, timeout, target, step)
+            continue
+        draw_popup(screen, [name, f"{state['command_info']} [{SPINNER[spin % len(SPINNER)]}]", "",
+                            "[Esc] cancel"])
+        spin += 1
+        screen.timeout(int(poll_delay_s(state) * 1000))
+        key = screen.getch()
+        screen.timeout(-1)
+        if key in (27, curses.KEY_LEFT):
+            cancelled = True
+            state = command_request(host, port, timeout, target, CommandStatus.CANCEL)
+        else:
+            state = command_request(host, port, timeout, target, CommandStatus.POLL)
+    if cancelled:
+        return f"command {name!r} cancelled"
+    info = state["command_info"].strip()
+    return f"command {name!r} finished" + (f": {info}" if info else "")
+
+
 def run_tui(screen, host: str, port: int, timeout: float) -> None:
     curses.curs_set(0)
+    curses.set_escdelay(25)
     selected = 0
     status = ""
     parent_stack = [0]
@@ -233,28 +297,47 @@ def run_tui(screen, host: str, port: int, timeout: float) -> None:
                         )
                         break
                     if parameter["type"] == "COMMAND":
-                        screen.erase()
-                        screen.addstr(
-                            0, 0,
-                            f"Run {parameter['name']!r}? {parameter['command_info']} [y/N] ")
-                        confirm = screen.getch() in (ord("y"), ord("Y"))
-                        if confirm:
-                            screen.erase()
-                            screen.addstr(0, 0, f"Running {parameter['name']!r}, waiting for it to finish...")
-                            screen.refresh()
-                            udp_request(host, port, timeout, {
-                                "command": "command",
-                                "parameter": str(parameter["id"]),
-                                "confirm": True,
-                            })
-                            status = f"command {parameter['name']!r} completed"
-                            break
-                        status = f"run {parameter['name']!r} cancelled"
-                        continue
+                        status = run_command_popup(screen, host, port, timeout, parameter)
+                        break
                 except (ProxyError, TimeoutError) as error:
                     status = f"{parameter['name']!r} failed: {error}"
                     continue
                 status = f"{parameter['name']!r} is read-only"
+
+
+def run_command_cli(host: str, port: int, timeout: float, name_or_id: str,
+                    assume_yes: bool) -> tuple[dict, int]:
+    """Run a COMMAND from the shell; returns (final state, exit code).
+
+    Same loop as the TUI popup: the device's confirmation text is asked on
+    stdin (or answered yes by --confirm), progress is printed on one line,
+    and Ctrl-C sends CANCEL before exiting.
+    """
+    target = str(udp_request(host, port, timeout, {"command": "get", "parameter": name_or_id})
+                 ["parameter"]["id"])
+    try:
+        state = command_request(host, port, timeout, target, CommandStatus.START)
+        while state["command_status"] != CommandStatus.READY:
+            if state["command_status"] == CommandStatus.CONFIRMATION_NEEDED:
+                if assume_yes:
+                    answer = "y"
+                else:
+                    try:
+                        answer = input(f"{state['command_info']} [y/N] ")
+                    except EOFError:
+                        answer = ""
+                if answer.strip().casefold() != "y":
+                    return command_request(host, port, timeout, target, CommandStatus.CANCEL), 1
+                state = command_request(host, port, timeout, target, CommandStatus.CONFIRM)
+                continue
+            print(f"\r{state['command_info']} (Ctrl-C to cancel)", end="", flush=True)
+            time.sleep(poll_delay_s(state))
+            state = command_request(host, port, timeout, target, CommandStatus.POLL)
+    except KeyboardInterrupt:
+        print()
+        return command_request(host, port, timeout, target, CommandStatus.CANCEL), 130
+    print()
+    return state, 0
 
 
 def main() -> int:
@@ -275,21 +358,26 @@ def main() -> int:
     set_parser.add_argument("value")
     command_parser = commands.add_parser("command")
     command_parser.add_argument("parameter")
-    command_parser.add_argument("--confirm", action="store_true")
+    command_parser.add_argument("--confirm", action="store_true",
+                                help="Answer yes to the device's confirmation prompt")
     commands.add_parser("tui")
     args = parser.parse_args()
 
     if args.command == "tui":
         curses.wrapper(run_tui, args.host, args.port, args.timeout)
         return 0
+    if args.command == "command":
+        state, code = run_command_cli(args.host, args.port, args.timeout, args.parameter, args.confirm)
+        print(json.dumps(state, indent=2) if args.json else
+              f"command {state['name']!r} {'finished' if code == 0 else 'cancelled'} "
+              f"status={state['command_status']} info={state['command_info'].strip()!r}")
+        return code
 
     request = {"command": args.command}
     if hasattr(args, "parameter"):
         request["parameter"] = args.parameter
     if hasattr(args, "value"):
         request["value"] = args.value
-    if hasattr(args, "confirm"):
-        request["confirm"] = args.confirm
     result = udp_request(args.host, args.port, args.timeout, request)
     if args.json:
         print(json.dumps(result, indent=2))

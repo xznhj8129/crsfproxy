@@ -40,6 +40,8 @@ from .crsf_protocol import (
     CRSF_ADDRESS_TRANSMITTER as ELRS_ADDRESS_TRANSMITTER,
     CRSF_CHANNEL_PAYLOAD_SIZE,
     CRSF_SYNC,
+    COMMAND_STEPS,
+    CommandStatus,
     DeviceInfo,
     Frame as CrsfFrame,
     FrameParser,
@@ -62,9 +64,6 @@ CONFIG_RESPONSE_LIMIT = 65507
 CONFIG_STATUS_INTERVAL_S = 1.0
 CONFIG_PARAMETER_TIMEOUT_S = 3.0
 CONFIG_DEVICE_DISCOVERY_S = 2.0
-# A COMMAND still reporting PROGRESS after this long is cancelled. Kept below
-# config_client.py's 60 s reply wait so the client always receives the outcome.
-CONFIG_COMMAND_RUN_LIMIT_S = 50.0
 
 
 def parameter_value(parameter: Parameter):
@@ -250,11 +249,20 @@ class ElrsConfigService:
                 "parameter": parameter_dict(result.parameter),
             }
         if command == "command":
-            result = self.client.command(
-                transmitter.address, parameter, bool(request.get("confirm", False)),
-                CONFIG_COMMAND_RUN_LIMIT_S)
+            result = self.client.command_step(
+                transmitter.address, parameter, command_step_from_request(request))
             return {"parameter": parameter_dict(result)}
         raise ValueError(f"unknown configuration command {request['command']!r}")
+
+
+def command_step_from_request(request: dict) -> CommandStatus:
+    """The COMMAND step named in a "command" request ("start", "poll", "confirm", "cancel")."""
+    name = str(request["step"])
+    step = CommandStatus.__members__.get(name.upper())
+    if step not in COMMAND_STEPS:
+        raise ValueError(f"command step={name!r} expected one of "
+                         f"{sorted(s.name.lower() for s in COMMAND_STEPS)}")
+    return step
 
 
 def parse_config_request(data: bytes) -> dict:
@@ -270,11 +278,7 @@ def parse_config_request(data: bytes) -> dict:
     if command == "set":
         return {"command": command, "parameter": words[1], "value": words[2]}
     if command == "command":
-        return {
-            "command": command,
-            "parameter": words[1],
-            "confirm": "--confirm" in words[2:],
-        }
+        return {"command": command, "parameter": words[1], "step": words[2]}
     raise ValueError(f"unknown configuration command {words[0]!r}")
 
 

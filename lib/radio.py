@@ -14,8 +14,9 @@ Per radio, and nothing else:
                      reach the configuration client
   service_type       constructed with the transport; execute(request) runs a
                      parsed configuration request (info, devices, params,
-                     get, set, command) against the module and returns the
-                     JSON-ready result
+                     get, set, and one COMMAND step per request, see
+                     crsf_protocol.COMMAND_STEPS) against the module and
+                     returns the JSON-ready result
   status_poll_frame  frame queued once per CONFIG_STATUS_INTERVAL_S to keep
                      the module's status fresh, or None for no poll
 

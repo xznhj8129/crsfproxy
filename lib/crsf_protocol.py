@@ -71,6 +71,18 @@ class CommandStatus(IntEnum):
     POLL = 6                  # lcsQuery: UI asks for a status update
 
 
+# Steps a UI sends to run a COMMAND, the way elrs.lua drives one:
+#   START, then by the reported status:
+#     READY                -> finished
+#     CONFIRMATION_NEEDED  -> show command_info; CONFIRM or CANCEL
+#     anything else        -> running; POLL every command_timeout x 10 ms,
+#                             CANCEL when the user leaves (elrs.lua: RTN)
+# Every step is answered with the parameter's current status. The UDP
+# configuration API names a step by its lower-case member name ("start").
+COMMAND_STEPS = frozenset({CommandStatus.START, CommandStatus.CONFIRM,
+                           CommandStatus.CANCEL, CommandStatus.POLL})
+
+
 @dataclass(frozen=True)
 class Frame:
     address: int
