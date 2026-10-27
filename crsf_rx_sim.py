@@ -38,6 +38,7 @@ from lib.crsf_protocol import (
     make_rc_frame,
 )
 from lib.rc_packet import RcPacket
+from lib.schedule import DeadlineSchedule
 
 DEFAULT_RC_RATE_HZ = 150.0
 DEFAULT_LINK_RATE_HZ = 10.0
@@ -520,11 +521,10 @@ def run(args: argparse.Namespace) -> None:
     connection: socket.socket | None = None
     parser = FrameParser()
     last_connect_attempt = 0.0
-    next_rc_at = time.monotonic()
-    next_link_at = next_rc_at
-    next_status_at = next_rc_at + 1.0
-    rc_period = 1.0 / args.rc_rate
-    link_period = 1.0 / args.link_rate if args.link_rate else None
+    started_at = time.monotonic()
+    rc_schedule = DeadlineSchedule(args.rc_rate, started_at)
+    link_schedule = DeadlineSchedule(args.link_rate, started_at) if args.link_rate else None
+    next_status_at = started_at + 1.0
     loop_period = 1.0 / args.loop_rate
 
     print(
@@ -574,7 +574,7 @@ def run(args: argparse.Namespace) -> None:
                         args.debug,
                     )
 
-                    if loop_started_at >= next_rc_at:
+                    if rc_schedule.due(loop_started_at):
                         channels = state.output_channels(loop_started_at)
                         if channels is not None:
                             frame = make_rc_frame(channels)
@@ -585,10 +585,8 @@ def run(args: argparse.Namespace) -> None:
                                     f"TX RC rf_link={state.rf_link} "
                                     f"channels_1_4={channels[:4]} frame_hex={frame.hex()}"
                                 )
-                        while next_rc_at <= loop_started_at:
-                            next_rc_at += rc_period
 
-                    if link_period is not None and loop_started_at >= next_link_at:
+                    if link_schedule is not None and link_schedule.due(loop_started_at):
                         frame = state.link.frame(state.rf_link)
                         connection.sendall(frame)
                         state.transmitted_link_frames += 1
@@ -598,8 +596,6 @@ def run(args: argparse.Namespace) -> None:
                                 f"uplink_lq={state.link.uplink_lq if state.rf_link else 0} "
                                 f"frame_hex={frame.hex()}"
                             )
-                        while next_link_at <= loop_started_at:
-                            next_link_at += link_period
                 except (BrokenPipeError, ConnectionError, ConnectionResetError, OSError) as error:
                     print(
                         f"TCP disconnected name={args.name!r} endpoint={args.endpoint!r} "

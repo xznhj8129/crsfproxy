@@ -51,6 +51,7 @@ from .crsf_protocol import (
 )
 from .elrs_config import ParameterClient
 from .rc_packet import RcPacket, RcPacketError
+from .schedule import DeadlineSchedule
 
 WRITE_TIMEOUT_S = 0.1
 DEFAULT_BAUD = 115200
@@ -453,10 +454,11 @@ def main():
 
     if args.rc_hold_ms < 0:
         parser.error('--rc-hold-ms must be >= 0')
+    if not args.tx_rate > 0:
+        parser.error('--tx_rate must be > 0')
 
     HOST = args.host
     PORT = args.port
-    tx_rate = float(args.tx_rate)
     loop_hz = float(args.loop_hz)
     loop_period = 1.0 / loop_hz
     rc_hold_ms = int(args.rc_hold_ms)
@@ -523,17 +525,17 @@ def main():
 
     last_rc_sender = None
     last_rc_update_t = 0.0
-    last_tx_t = 0.0
     last_valid_channels_us = None
     rc_update_seq = 0
     last_sent_rc_seq = 0
     last_control_state = None
     last_tx_debug_t = 0.0
+    rc_schedule = DeadlineSchedule(args.tx_rate, time.monotonic())
 
     try:
         while True:
-            loop_start = time.time()
-            now = time.time()
+            loop_start = time.monotonic()
+            now = loop_start
 
             # Read RC updates from UDP (drain socket, keep latest)
             while True:
@@ -668,7 +670,7 @@ def main():
                         print(f"TEL DEVICE_INFO {pkt['raw']}")
 
             # Send fresh RC, or optionally hold the latest sample for a short gap.
-            if (now - last_tx_t) >= (1.0 / tx_rate):
+            if rc_schedule.due(now):
                 if config_transport is not None and now >= next_config_status_t:
                     config_transport.queue(make_extended_frame(
                         FrameType.PARAMETER_WRITE,
@@ -727,9 +729,8 @@ def main():
                         )
                 except serial.SerialTimeoutException as e:
                     print(f"Serial write timeout port={args.device} baud={args.baud} burst_len={len(burst)} elapsed_ms={elapsed_ms:.1f} err={e}")
-                last_tx_t = now
 
-            loop_elapsed = time.time() - loop_start
+            loop_elapsed = time.monotonic() - loop_start
             if loop_elapsed < loop_period:
                 time.sleep(loop_period - loop_elapsed)
 

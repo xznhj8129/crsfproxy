@@ -389,7 +389,7 @@ Full documentation: [`SITL_RECEIVER.md`](SITL_RECEIVER.md). Two-receiver launch 
 - 📉 ELRS hides packet rates that can't fit over the configured handset baud. At 115200 the TX reports `Baud rate too low` and blanks rates such as 333 Hz and 500 Hz — use 921600 to expose the full high-rate table.
 - mLRS only supports 400K baud on its handset-side CRSF interface.
 - 🐛 Some CP2102 USB serial adapters behave badly around 400–460K baud.
-- ⏱️ **Known issue:** the actual RC frame rate is below `--tx_rate`. A frame is sent once at least `1/tx_rate` has passed since the previous one, checked once per `--loop_hz` pass, so the interval rounds up to whole loop periods. Measured with the defaults: `--tx_rate 100` → about 82 Hz, `--tx_rate 150` → about 122 Hz.
+- ⏱️ **RC timing:** RC slots run on a fixed deadline grid (slot *n* due at start + *n* / `--tx_rate`, `lib/schedule.py`), so the slot rate equals `--tx_rate` as long as `--loop_hz` is higher; each frame goes out up to one loop period after its deadline, and a late slot is skipped rather than sent in a burst. With the default `--loop_hz 250`, `--tx_rate` above 250 is capped by the loop (measured: 300 → about 244 Hz); raise `--loop_hz` with it.
 
 > [!WARNING]
 > The configuration port has **no authentication**. Bind it to a trusted interface or restrict it with a firewall.
@@ -419,6 +419,7 @@ lib/
     elrs_config.py    ELRS device-parameter protocol client
     crsf_protocol.py  CRSF frame codec
     rc_packet.py      the 40-byte UDP RC packet
+    schedule.py       fixed-rate deadline schedule (proxy + simulator)
 
 examples/
     dual_receiver_commands.sh
