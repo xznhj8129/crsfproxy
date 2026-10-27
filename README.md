@@ -385,12 +385,12 @@ Full documentation: [`SITL_RECEIVER.md`](SITL_RECEIVER.md). Two-receiver launch 
 | Flag | Default | Description |
 |---|---|---|
 | `--radio` | `elrs` | Radio backend: `elrs` or `mlrs` |
-| `--device` | `/dev/ttyUSB0` | Serial device or pySerial URL, e.g. `socket://127.0.0.1:5762` |
+| `--device` | `/dev/ttyUSB0` | Serial device or pySerial URL. `socket://host:port` is a transparent TCP bridge (e.g. the ESP32-P4 CRSF bridge); `--baud` is ignored over `socket://` |
 | `--baud` | `115200` | CRSF serial baudrate; mLRS defaults to `400000` |
 | `--host` | `0.0.0.0` | UDP bind host for RC packets |
 | `--port` | `60000` | UDP port for RC packets |
 | `--tx_rate` | `100` | Maximum RC frame rate (Hz) |
-| `--loop_hz` | `250` | Max main loop rate (Hz) — caps main-loop CPU |
+| `--loop_hz` | `250` | Max main loop rate (Hz) — caps main-loop CPU, keep above tx_rate |
 | `--rc-hold-ms` | `0` | Repeat the latest RC sample for up to this many ms after input stops; `0` disables hold |
 | `--telemetry_udp` | — | Send raw CRSF telemetry to `host:port` (e.g. MWP) |
 | `--config_udp` | RC port + 1 | UDP port for TX configuration commands |
@@ -399,6 +399,7 @@ Full documentation: [`SITL_RECEIVER.md`](SITL_RECEIVER.md). Two-receiver launch 
 ## 📝 Notes & gotchas
 
 - **Baud startup:** The serial port opens directly at `--baud` and immediately streams RC frames. ExpressLRS detects the handset baud from that continuous CRSF traffic.
+- **Transparent TCP bridge:** `--device socket://host:port` drives a remote serial bridge such as the ESP32-P4 CRSF bridge. The bridge owns the UART baud (`--baud` is ignored over the socket); RC input, telemetry and `config_client.py` work over the same connection.
 - 📉 ELRS hides packet rates that can't fit over the configured handset baud. At 115200 the TX reports `Baud rate too low` and blanks rates such as 333 Hz and 500 Hz — use 921600 to expose the full high-rate table.
 - mLRS only supports 400K baud on its handset-side CRSF interface.
 - 🐛 Some CP2102 USB serial adapters behave badly around 400–460K baud.
@@ -449,3 +450,7 @@ Run the tests from the repository root:
 ```bash
 python3 -m unittest discover -s tests -v
 ```
+
+## 📄 License
+
+[GPL-3.0](LICENSE), the same as ExpressLRS.
