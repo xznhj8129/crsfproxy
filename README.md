@@ -418,6 +418,7 @@ lib/
     mlrs_backend.py   mLRS mBridge configuration backend
     elrs_config.py    ELRS device-parameter protocol client
     crsf_protocol.py  CRSF frame codec
+    rc_packet.py      the 40-byte UDP RC packet
 
 examples/
     dual_receiver_commands.sh

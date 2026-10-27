@@ -11,17 +11,18 @@ Each --target starts one destination. A following --port applies to that target.
 Targets without an explicit port use 60000.
 
 UDP packet format:
-<uint32 t_ms><16 x uint16 us><uint32 crc32>
+<uint32 t_ms><16 x uint16 us><uint32 crc32>, defined in lib/rc_packet.py
 """
 
 import argparse
 import socket
-import struct
 import sys
 import time
-import zlib
 
 import pygame
+
+from lib.crsf_protocol import CRSF_CHANNEL_COUNT
+from lib.rc_packet import RcPacket
 
 
 MIN_US = 900
@@ -188,7 +189,7 @@ def main() -> None:
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     print("Sending UDP RC to " + ", ".join(f"{host}:{port}" for host, port in targets) + ".")
 
-    channels = [MID_US] * 16
+    channels = [MID_US] * CRSF_CHANNEL_COUNT
     channels[2] = MIN_US
     channels[4] = MIN_US
     armed = False
@@ -237,9 +238,7 @@ def main() -> None:
                     print(f"buttons={buttons} channels={channels}")
                     dbg_t = now
 
-            payload = struct.pack("<I16H", int(time.time() * 1000) & 0xFFFFFFFF, *channels)
-            crc = zlib.crc32(payload) & 0xFFFFFFFF
-            packet = payload + struct.pack("<I", crc)
+            packet = RcPacket(int(time.time() * 1000) & 0xFFFFFFFF, tuple(channels)).encode()
             for target in targets:
                 sock.sendto(packet, target)
 

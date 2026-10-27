@@ -27,11 +27,8 @@ import json
 import queue
 import shlex
 import socket
-import struct
 import threading
 import time
-import zlib
-from enum import IntEnum
 
 import serial
 
@@ -39,27 +36,25 @@ from .crsf_protocol import (
     CRSF_ADDRESS_ELRS_LUA,
     CRSF_ADDRESS_RADIO_TRANSMITTER,
     CRSF_ADDRESS_TRANSMITTER as ELRS_ADDRESS_TRANSMITTER,
+    CRSF_CHANNEL_PAYLOAD_SIZE,
+    CRSF_SYNC,
     DeviceInfo,
     Frame as CrsfFrame,
     FrameType,
     Parameter,
     ParameterType,
+    crsf_to_us,
     make_extended_frame,
+    make_rc_frame,
+    unpack_channels,
+    validate_frame,
 )
 from .elrs_config import ParameterClient
+from .rc_packet import RcPacket, RcPacketError
 
-CRSF_SYNC = 0xC8
-CRSF_TRANSMITTER = 0xEE
-CHANNEL_COUNT = 16
-MIN_US = 900
-MAX_US = 2100
-ARM_LOW_US = 900
-MID_US = 1500
-UDP_PAYLOAD_LEN = 4 + CHANNEL_COUNT * 2
-UDP_PACKET_LEN = UDP_PAYLOAD_LEN + 4
 WRITE_TIMEOUT_S = 0.1
 DEFAULT_BAUD = 115200
-SERIAL_RX_HEADERS = (CRSF_SYNC, CRSF_TRANSMITTER)
+SERIAL_RX_HEADERS = (CRSF_SYNC, ELRS_ADDRESS_TRANSMITTER)
 CONFIG_RESPONSE_LIMIT = 65507
 CONFIG_STATUS_INTERVAL_S = 1.0
 CONFIG_PARAMETER_TIMEOUT_S = 3.0
@@ -316,107 +311,8 @@ class ConfigUdpServer(threading.Thread):
         self.join()
         self.socket.close()
 
-class PacketsTypes(IntEnum):
-    GPS = 0x02
-    VARIO = 0x07
-    BATTERY_SENSOR = 0x08
-    BARO_ALT = 0x09
-    HEARTBEAT = 0x0B
-    VIDEO_TRANSMITTER = 0x0F
-    LINK_STATISTICS = 0x14
-    RC_CHANNELS_PACKED = 0x16
-    ATTITUDE = 0x1E
-    FLIGHT_MODE = 0x21
-    DEVICE_INFO = 0x29
-    CONFIG_READ = 0x2C
-    CONFIG_WRITE = 0x2D
-    RADIO_ID = 0x3A
-
-def crc8_dvb_s2(crc, a) -> int:
-    crc ^= a
-    for _ in range(8):
-        if crc & 0x80:
-            crc = (crc << 1) ^ 0xD5
-        else:
-            crc <<= 1
-    return crc & 0xFF
-
-def crc8_data(data) -> int:
-    crc = 0
-    for a in data:
-        crc = crc8_dvb_s2(crc, a)
-    return crc
-
-def crsf_validate_frame(frame) -> bool:
-    # frame = [0]sync [1]len [2]type ... [n]crc
-    if len(frame) < 4:
-        return False
-    return crc8_data(frame[2:-1]) == frame[-1]
-
 def signed_byte(b: int) -> int:
     return b - 256 if b >= 128 else b
-
-def us_to_crsf(us: int) -> int:
-    # 1000..2000 us -> 172..1811 (1639 steps)
-    us = max(1000, min(2000, int(us)))
-    return 172 + round((us - 1000) * 1639 / 1000)
-
-def crsf_to_us(v: int) -> int:
-    v = max(172, min(1811, int(v)))
-    return 1000 + round((v - 172) * 1000 / 1639)
-
-def packCrsfToBytes(channels) -> bytes:
-    # channels are 16 ints in CRSF range (0..1811, typical 172..1811)
-    if len(channels) != CHANNEL_COUNT:
-        raise ValueError(f"CRSF must have {CHANNEL_COUNT} channels")
-    result = bytearray()
-    destShift = 0
-    newVal = 0
-    for ch in channels:
-        newVal |= (ch << destShift) & 0xFF
-        result.append(newVal)
-        srcBitsLeft = 11 - 8 + destShift
-        newVal = ch >> (11 - srcBitsLeft)
-        if srcBitsLeft >= 8:
-            result.append(newVal & 0xFF)
-            newVal >>= 8
-            srcBitsLeft -= 8
-        destShift = srcBitsLeft
-    return result  # 22 bytes
-
-def channelsCrsfToChannelsPacket(channels_crsf) -> bytes:
-    # channels_crsf: list of 16 values already in CRSF units
-    payload = bytearray([PacketsTypes.RC_CHANNELS_PACKED])
-    payload += packCrsfToBytes(channels_crsf)
-    length = len(payload) + 1  # +1 for CRC
-    frame = bytearray([CRSF_SYNC, length]) + payload
-    frame.append(crc8_data(frame[2:]))
-    return frame
-
-def channelsUsToPacket(us_channels) -> bytes:
-    # us_channels: list of 16 microsecond values
-    if len(us_channels) != CHANNEL_COUNT:
-        raise ValueError(f"Need {CHANNEL_COUNT} channels")
-    crsf_ch = [us_to_crsf(v) for v in us_channels]
-    return channelsCrsfToChannelsPacket(crsf_ch)
-
-def unpack_rc_channels(payload: bytes) -> list:
-    # payload is the 22 data bytes after type
-    ch = []
-    acc = 0
-    bits = 0
-    for b in payload[:22]:
-        acc |= (b & 0xFF) << bits
-        bits += 8
-        if bits >= 11:
-            ch.append(acc & 0x7FF)
-            acc >>= 11
-            bits -= 11
-            if len(ch) == CHANNEL_COUNT:
-                break
-    if len(ch) != CHANNEL_COUNT:
-        ch += [172] * (CHANNEL_COUNT - len(ch))
-    return ch
 
 def handleCrsfPacket(ptype: int, data: bytes, verbose=False):
     """
@@ -424,19 +320,19 @@ def handleCrsfPacket(ptype: int, data: bytes, verbose=False):
     data is the whole frame, including sync and crc.
     """
     try:
-        pkt_type = PacketsTypes(ptype)
+        pkt_type = FrameType(ptype)
     except ValueError:
         pkt_type = None
 
     now = time.time()
     out = {"t": now, "ptype": int(ptype)}
 
-    if pkt_type == PacketsTypes.RADIO_ID:
+    if pkt_type == FrameType.RADIO_ID:
         out["type"] = "RADIO_ID"
         out["raw"] = data.hex()
         return out
 
-    if pkt_type == PacketsTypes.LINK_STATISTICS:
+    if pkt_type == FrameType.LINK_STATISTICS:
         out.update({
             "type": "LINK_STATISTICS",
             "rssi1": signed_byte(data[3]),
@@ -452,7 +348,7 @@ def handleCrsfPacket(ptype: int, data: bytes, verbose=False):
         })
         return out
 
-    if pkt_type == PacketsTypes.ATTITUDE:
+    if pkt_type == FrameType.ATTITUDE:
         out.update({
             "type": "ATTITUDE",
             "pitch_rad": int.from_bytes(data[3:5], "big", signed=True) / 10000.0,
@@ -461,7 +357,7 @@ def handleCrsfPacket(ptype: int, data: bytes, verbose=False):
         })
         return out
 
-    if pkt_type == PacketsTypes.FLIGHT_MODE:
+    if pkt_type == FrameType.FLIGHT_MODE:
         raw_mode = bytes(data[3:-1]).decode("ascii", errors="ignore")
         clean = []
         for ch in raw_mode:
@@ -481,7 +377,7 @@ def handleCrsfPacket(ptype: int, data: bytes, verbose=False):
         })
         return out
 
-    if pkt_type == PacketsTypes.BATTERY_SENSOR:
+    if pkt_type == FrameType.BATTERY_SENSOR:
         out.update({
             "type": "BATTERY_SENSOR",
             "vbat_v": int.from_bytes(data[3:5], "big", signed=True) / 10.0,
@@ -491,21 +387,21 @@ def handleCrsfPacket(ptype: int, data: bytes, verbose=False):
         })
         return out
 
-    if pkt_type == PacketsTypes.BARO_ALT:
+    if pkt_type == FrameType.BARO_ALTITUDE:
         out.update({
             "type": "BARO_ALT",
             "alt_m": int.from_bytes(data[3:7], "big", signed=True) / 100.0,
         })
         return out
 
-    if pkt_type == PacketsTypes.DEVICE_INFO:
+    if pkt_type == FrameType.DEVICE_INFO:
         out.update({
             "type": "DEVICE_INFO",
             "raw": data.hex()
         })
         return out
 
-    if pkt_type == PacketsTypes.GPS:
+    if pkt_type == FrameType.GPS:
         out.update({
             "type": "GPS",
             "lat": int.from_bytes(data[3:7], "big", signed=True) / 1e7,
@@ -517,16 +413,16 @@ def handleCrsfPacket(ptype: int, data: bytes, verbose=False):
         })
         return out
 
-    if pkt_type == PacketsTypes.VARIO:
+    if pkt_type == FrameType.VARIO:
         out.update({
             "type": "VARIO",
             "vspd_ms": int.from_bytes(data[3:5], "big", signed=True) / 10.0,
         })
         return out
 
-    if pkt_type == PacketsTypes.RC_CHANNELS_PACKED:
-        payload = data[3:-1]  # type already at [2], CRC at [-1]
-        ch_crsf = unpack_rc_channels(payload)
+    payload = data[3:-1]  # type already at [2], CRC at [-1]
+    if pkt_type == FrameType.RC_CHANNELS_PACKED and len(payload) == CRSF_CHANNEL_PAYLOAD_SIZE:
+        ch_crsf = unpack_channels(payload)
         out.update({
             "type": "RC_CHANNELS_PACKED",
             "ch_crsf": ch_crsf,
@@ -645,17 +541,11 @@ def main():
                     data, sender = rc_sock.recvfrom(128)
                 except (BlockingIOError, InterruptedError):
                     break
-                if len(data) != UDP_PACKET_LEN:
-                    print(f"Bad RC packet length {len(data)} from {sender}")
+                try:
+                    ch = list(RcPacket.decode(data).channels_us)
+                except RcPacketError as error:
+                    print(f"RC packet rejected sender={sender} {error}")
                     continue
-                payload = data[:UDP_PAYLOAD_LEN]
-                crc_rx = struct.unpack_from("<I", data, UDP_PAYLOAD_LEN)[0]
-                crc_calc = zlib.crc32(payload) & 0xFFFFFFFF
-                if crc_calc != crc_rx:
-                    print(f"CRC mismatch from {sender}: got {crc_rx:08x} expected {crc_calc:08x}")
-                    continue
-                _ts_ms = struct.unpack_from("<I", payload, 0)[0]
-                ch = list(struct.unpack_from("<16H", payload, 4))
                 if args.debug and sender != last_rc_sender:
                     print(f"Receiving RC from {sender} ch0-3={ch[:4]} ch4-7={ch[4:8]}")
                 last_valid_channels_us = ch
@@ -727,7 +617,7 @@ def main():
                     break
                 frame = bytes(input_buf[:expected_len])
                 del input_buf[:expected_len]
-                if not crsf_validate_frame(frame):
+                if not validate_frame(frame):
                     if args.debug:
                         print(
                             f"Serial discard reason=crc_error "
@@ -819,7 +709,7 @@ def main():
                     print(line)
                     last_tx_debug_t = now
 
-                rc_frame = channelsUsToPacket(active) if active is not None else b''
+                rc_frame = make_rc_frame(active) if active is not None else b''
                 control_frames = config_transport.drain_outbound() \
                     if config_transport is not None else []
                 burst = rc_frame + b''.join(control_frames)

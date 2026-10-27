@@ -28,6 +28,7 @@ class FrameType(IntEnum):
     BATTERY_SENSOR = 0x08
     BARO_ALTITUDE = 0x09
     HEARTBEAT = 0x0B
+    VIDEO_TRANSMITTER = 0x0F
     LINK_STATISTICS = 0x14
     RC_CHANNELS_PACKED = 0x16
     ATTITUDE = 0x1E
@@ -184,11 +185,16 @@ def pack_channels_us(channels_us: list[int]) -> bytes:
     return packed.to_bytes(CRSF_CHANNEL_PAYLOAD_SIZE, "little")
 
 
-def unpack_channels_us(payload: bytes) -> list[int]:
+def unpack_channels(payload: bytes) -> list[int]:
+    """Raw 11-bit CRSF channel values."""
     if len(payload) != CRSF_CHANNEL_PAYLOAD_SIZE:
         raise ValueError(f"channel_payload_size={len(payload)} expected={CRSF_CHANNEL_PAYLOAD_SIZE}")
     packed = int.from_bytes(payload, "little")
-    return [crsf_to_us((packed >> (index * 11)) & 0x7FF) for index in range(CRSF_CHANNEL_COUNT)]
+    return [(packed >> (index * 11)) & 0x7FF for index in range(CRSF_CHANNEL_COUNT)]
+
+
+def unpack_channels_us(payload: bytes) -> list[int]:
+    return [crsf_to_us(value) for value in unpack_channels(payload)]
 
 
 def make_rc_frame(channels_us: list[int]) -> bytes:

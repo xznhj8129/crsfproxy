@@ -23,7 +23,6 @@ import socket
 import struct
 import sys
 import time
-import zlib
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -31,16 +30,15 @@ from urllib.parse import urlparse
 
 from lib.crsf_protocol import (
     CRSF_ADDRESS_FLIGHT_CONTROLLER,
+    CRSF_CHANNEL_COUNT,
     FrameParser,
     FrameType,
     describe_frame,
     make_frame,
     make_rc_frame,
 )
+from lib.rc_packet import RcPacket
 
-CHANNEL_COUNT = 16
-RC_UDP_PAYLOAD_LEN = 4 + CHANNEL_COUNT * 2
-RC_UDP_PACKET_LEN = RC_UDP_PAYLOAD_LEN + 4
 DEFAULT_RC_RATE_HZ = 150.0
 DEFAULT_LINK_RATE_HZ = 10.0
 DEFAULT_LOOP_RATE_HZ = 500.0
@@ -90,9 +88,9 @@ def parse_host_port(value: str) -> tuple[str, int]:
 
 
 def parse_channels(values: list[str] | tuple[str, ...]) -> list[int]:
-    if len(values) != CHANNEL_COUNT:
+    if len(values) != CRSF_CHANNEL_COUNT:
         raise ConfigurationError(
-            f"channel_count={len(values)} expected={CHANNEL_COUNT} values={values}"
+            f"channel_count={len(values)} expected={CRSF_CHANNEL_COUNT} values={values}"
         )
     channels = [int(value) for value in values]
     for index, value in enumerate(channels):
@@ -104,24 +102,14 @@ def parse_channels(values: list[str] | tuple[str, ...]) -> list[int]:
 
 
 def decode_udp_rc_packet(data: bytes) -> tuple[int, list[int]]:
-    if len(data) != RC_UDP_PACKET_LEN:
-        raise ValueError(f"packet_len={len(data)} expected={RC_UDP_PACKET_LEN}")
-    payload = data[:RC_UDP_PAYLOAD_LEN]
-    received_crc = struct.unpack_from("<I", data, RC_UDP_PAYLOAD_LEN)[0]
-    calculated_crc = zlib.crc32(payload) & 0xFFFFFFFF
-    if received_crc != calculated_crc:
-        raise ValueError(
-            f"packet_crc=0x{received_crc:08X} expected_crc=0x{calculated_crc:08X}"
-        )
-    unpacked = struct.unpack("<I16H", payload)
-    timestamp_ms = unpacked[0]
-    channels = list(unpacked[1:])
+    packet = RcPacket.decode(data)
+    channels = list(packet.channels_us)
     for index, value in enumerate(channels):
         if not 750 <= value <= 2250:
             raise ValueError(
                 f"channel_index={index} channel_value_us={value} valid_range=750..2250"
             )
-    return timestamp_ms, channels
+    return packet.timestamp_ms, channels
 
 
 def encode_signed_byte(value: int) -> int:
@@ -481,14 +469,14 @@ def build_argument_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--channels",
-        nargs=CHANNEL_COUNT,
+        nargs=CRSF_CHANNEL_COUNT,
         default=[str(value) for value in DEFAULT_CHANNELS_US],
         metavar="US",
         help="Initial 16 channel values in microseconds",
     )
     parser.add_argument(
         "--failsafe_channels",
-        nargs=CHANNEL_COUNT,
+        nargs=CRSF_CHANNEL_COUNT,
         default=[str(value) for value in DEFAULT_FAILSAFE_CHANNELS_US],
         metavar="US",
         help="16 channel values used by failsafe policies",
