@@ -46,6 +46,24 @@ def button_to_us(pressed: int) -> int:
 
 
 def get_joystick_state(joystick, min_axes):
+    # roll, pitch, throt, yaw, SE, SB, SF, SE; Down/Left= -1
+    #Far LT     6
+    #Near LT    4
+    #Far RT     7
+    #Near RT    5
+    #A1         0
+    #B          1
+    #C          2
+    #D          3
+    # SELECT    8
+    # START     9
+    #JSCLICK L 10
+    #JSCLICK R  11
+    # Down = positive direction
+    #L JOY DOWN 2
+    #L JOY RIGHT 1
+    #R JOY DOWN  3
+    #R JOY RIGHT 4
     pygame.event.pump()
     axes = [round(joystick.get_axis(i), 3) for i in range(joystick.get_numaxes())]
     buttons = [joystick.get_button(i) for i in range(joystick.get_numbuttons())]

@@ -550,7 +550,7 @@ def main():
     parser.add_argument('--loop_hz', type=float, default=250.0, help="Max main loop rate Hz")
     parser.add_argument('--rc-hold-ms', type=int, default=0, metavar='MS',
                         help="Repeat the latest RC sample for up to MS after input stops; 0 disables hold (default)")
-    parser.add_argument('--telemetry_udp', help="Send raw CRSF telemetry frames to udp://host:port (e.g. MWP)")
+    parser.add_argument('--telemetry_udp', help="Send raw CRSF telemetry frames to host:port (e.g. MWP)")
     parser.add_argument('--config_udp', type=int, help="UDP port for TX elrs.lua configuration commands")
     parser.add_argument('--debug', action='store_true', help="Verbose RC/telemetry logging")
     args = parser.parse_args()

@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""mLRS frontend for crsfproxy.
+"""mLRS backend for crsfproxy (selected with crsfproxy.py --radio mlrs).
 
-This keeps crsfproxy's UDP RC, CRSF serial, telemetry forwarding, and failsafe
+This keeps crsfproxy's UDP RC, CRSF serial, RC hold, and telemetry forwarding
 logic unchanged while replacing the ExpressLRS parameter service with mLRS's
 mBridge-over-CRSF configurator protocol.
 
 Usage is the same as crsfproxy.py. mLRS only supports 400000 baud on the radio
-CRSF interface, so this wrapper supplies 400000 when --baud is not specified.
+CRSF interface, so this backend supplies 400000 when --baud is not specified.
 
 Example:
-  python3 mlrsproxy.py --device /dev/ttyUSB0 --config_udp 60001 \
+  python3 crsfproxy.py --radio mlrs --device /dev/ttyUSB0 \
       --telemetry_udp 127.0.0.1:40042
 
 The existing config_client.py can then be used for info/params/get/set and
