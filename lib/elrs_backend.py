@@ -565,19 +565,17 @@ def run_proxy(options: ProxyOptions, radio: RadioBackend) -> None:
                 last_rc_sender = sender
                 rc_update_seq += 1
 
-            # Read from serial
+            # Read from serial. Do not use in_waiting: pyserial's socket://
+            # reports len(select(...)) == 1 instead of the byte count, which
+            # forces one-byte reads. A zero-timeout block read returns all
+            # available bytes for both real UARTs and socket://.
             try:
-                waiting = ser.in_waiting
+                chunk = ser.read(256)
             except OSError as e:
-                print(f"Serial in_waiting failed port={options.device} baud={options.baud} err={e}")
+                print(f"Serial read failed port={options.device} baud={options.baud} err={e}")
                 raise
             frames = []
-            if waiting > 0:
-                try:
-                    chunk = ser.read(waiting)
-                except OSError as e:
-                    print(f"Serial read failed port={options.device} baud={options.baud} waiting={waiting} err={e}")
-                    raise
+            if chunk:
                 if chunk.startswith(b"$X"):
                     # Some devices prepend 8 bytes of junk
                     chunk = chunk[8:]

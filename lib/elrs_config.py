@@ -125,16 +125,15 @@ class SerialPort:
         print(f"{elapsed:10.6f} {line}", file=self.traffic_log, flush=True)
 
     def read_frames(self) -> list[Frame]:
+        # socket:// in_waiting is always 1 (pyserial reports the number of
+        # ready descriptors, not bytes). A zero-timeout block read returns
+        # all available bytes for both real UARTs and socket://.
         try:
-            waiting = self.serial.in_waiting
+            data = self.serial.read(256)
         except serial.SerialException as error:
             raise serial.SerialException(f"{self.device}: {error}") from error
-        if not waiting:
+        if not data:
             return []
-        try:
-            data = self.serial.read(waiting)
-        except serial.SerialException as error:
-            raise serial.SerialException(f"{self.device}: {error}") from error
         self.bytes_read += len(data)
         frames = self.parser.feed(data)
         if self.traffic_log:
