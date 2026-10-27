@@ -247,6 +247,8 @@ A curses browser over the live parameter hierarchy read from the module, in your
 
 Selection parameters get a choice list; numeric parameters get a text prompt and are **verified by reading them back**. Empty selection placeholders sent by ELRS are hidden without disturbing their underlying selection indices. A persistent banner shows the latest ELRS status message, connection state, flags, and good/bad packet counts.
 
+Commands (Bind, WiFi update, …) are polled until the module reports them finished, as `elrs.lua` does, however long the module keeps reporting progress; a command still running after 50 s is cancelled (the same cancel `elrs.lua` sends on RTN) and reported. A failed action is shown on the TUI status line.
+
 <details>
 <summary><b>What <code>info</code> returns</b></summary>
 

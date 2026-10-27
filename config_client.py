@@ -16,10 +16,14 @@ import socket
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 60001
-DEFAULT_TIMEOUT_S = 60.0
+DEFAULT_TIMEOUT_S = 60.0  # crsfproxy cancels a COMMAND still running after 50 s
 UDP_RESPONSE_LIMIT = 65507
 WRITABLE_TYPES = {"UINT8", "INT8", "UINT16", "INT16", "UINT32", "INT32",
                   "UINT64", "INT64", "FLOAT", "SELECTION"}
+
+
+class ProxyError(RuntimeError):
+    """crsfproxy answered a configuration request with ok=false."""
 
 
 def udp_request(host: str, port: int, timeout: float, request: dict) -> dict:
@@ -30,7 +34,7 @@ def udp_request(host: str, port: int, timeout: float, request: dict) -> dict:
         response, sender = sock.recvfrom(UDP_RESPONSE_LIMIT)
     decoded = json.loads(response)
     if not decoded["ok"]:
-        raise RuntimeError(f"proxy={sender[0]}:{sender[1]} error={decoded['error']}")
+        raise ProxyError(f"proxy={sender[0]}:{sender[1]} error={decoded['error']}")
     return decoded["result"]
 
 
@@ -198,47 +202,58 @@ def run_tui(screen, host: str, port: int, timeout: float) -> None:
                     selected = 0
                     status = ""
                     continue
-                if parameter["type"] == "SELECTION":
-                    value = choose_option(screen, parameter)
-                    if value is None:
-                        status = f"edit {parameter['name']!r} cancelled"
-                        continue
-                    response = udp_request(host, port, timeout, {
-                        "command": "set",
-                        "parameter": str(parameter["id"]),
-                        "value": value,
-                    })
-                    status = (
-                        f"{parameter['name']}={response['parameter']['value']!r} "
-                        f"verified={int(response['verified'])}"
-                    )
-                    break
-                if parameter["type"] in WRITABLE_TYPES:
-                    value = prompt_value(screen, parameter)
-                    response = udp_request(host, port, timeout, {
-                        "command": "set",
-                        "parameter": str(parameter["id"]),
-                        "value": value,
-                    })
-                    status = (
-                        f"{parameter['name']}={response['parameter']['value']!r} "
-                        f"verified={int(response['verified'])}"
-                    )
-                    break
-                if parameter["type"] == "COMMAND":
-                    screen.erase()
-                    screen.addstr(
-                        0, 0,
-                        f"Run {parameter['name']!r}? {parameter['command_info']} [y/N] ")
-                    confirm = screen.getch() in (ord("y"), ord("Y"))
-                    if confirm:
-                        udp_request(host, port, timeout, {
-                            "command": "command",
+                # A failed action (proxy error reply, or no reply in time) is
+                # shown on the status line; the TUI keeps running.
+                try:
+                    if parameter["type"] == "SELECTION":
+                        value = choose_option(screen, parameter)
+                        if value is None:
+                            status = f"edit {parameter['name']!r} cancelled"
+                            continue
+                        response = udp_request(host, port, timeout, {
+                            "command": "set",
                             "parameter": str(parameter["id"]),
-                            "confirm": True,
+                            "value": value,
                         })
-                        status = f"command {parameter['name']!r} completed"
+                        status = (
+                            f"{parameter['name']}={response['parameter']['value']!r} "
+                            f"verified={int(response['verified'])}"
+                        )
                         break
+                    if parameter["type"] in WRITABLE_TYPES:
+                        value = prompt_value(screen, parameter)
+                        response = udp_request(host, port, timeout, {
+                            "command": "set",
+                            "parameter": str(parameter["id"]),
+                            "value": value,
+                        })
+                        status = (
+                            f"{parameter['name']}={response['parameter']['value']!r} "
+                            f"verified={int(response['verified'])}"
+                        )
+                        break
+                    if parameter["type"] == "COMMAND":
+                        screen.erase()
+                        screen.addstr(
+                            0, 0,
+                            f"Run {parameter['name']!r}? {parameter['command_info']} [y/N] ")
+                        confirm = screen.getch() in (ord("y"), ord("Y"))
+                        if confirm:
+                            screen.erase()
+                            screen.addstr(0, 0, f"Running {parameter['name']!r}, waiting for it to finish...")
+                            screen.refresh()
+                            udp_request(host, port, timeout, {
+                                "command": "command",
+                                "parameter": str(parameter["id"]),
+                                "confirm": True,
+                            })
+                            status = f"command {parameter['name']!r} completed"
+                            break
+                        status = f"run {parameter['name']!r} cancelled"
+                        continue
+                except (ProxyError, TimeoutError) as error:
+                    status = f"{parameter['name']!r} failed: {error}"
+                    continue
                 status = f"{parameter['name']!r} is read-only"
 
 

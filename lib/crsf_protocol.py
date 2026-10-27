@@ -60,6 +60,17 @@ class ParameterType(IntEnum):
     COMMAND = 13
 
 
+class CommandStatus(IntEnum):
+    """COMMAND parameter step/status (ExpressLRS commandStep_e, lcs*)."""
+    READY = 0                 # lcsIdle: not running, or finished
+    START = 1                 # lcsClick: user started the command
+    PROGRESS = 2              # lcsExecuting: running, poll for updates
+    CONFIRMATION_NEEDED = 3   # lcsAskConfirm: waiting for the user to confirm
+    CONFIRM = 4               # lcsConfirmed: user confirmed
+    CANCEL = 5                # lcsCancel: user cancelled
+    POLL = 6                  # lcsQuery: UI asks for a status update
+
+
 @dataclass(frozen=True)
 class Frame:
     address: int

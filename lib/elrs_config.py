@@ -29,6 +29,7 @@ from .crsf_protocol import (
     CRSF_ADDRESS_FLIGHT_CONTROLLER,
     CRSF_ADDRESS_RADIO_TRANSMITTER,
     CRSF_ADDRESS_TRANSMITTER,
+    CommandStatus,
     DeviceInfo,
     Frame,
     FrameParser,
@@ -393,31 +394,45 @@ class ParameterClient:
                 return WriteResult(updated, parameter.value, True)
         return WriteResult(updated, parameter.value, False)
 
-    def command(self, device_address: int, parameter: Parameter, confirm: bool = False) -> Parameter:
+    def command(self, device_address: int, parameter: Parameter, confirm: bool,
+                run_limit_seconds: float) -> Parameter:
+        """Run a COMMAND parameter the way elrs.lua does.
+
+        Start it, confirm it if the device asks and confirm is set, then poll
+        for as long as the device reports PROGRESS. Each poll must be answered
+        within timeout_seconds. elrs.lua polls until the user cancels; without
+        a user, a command still running after run_limit_seconds is cancelled
+        (the lcsCancel elrs.lua sends on RTN) and reported as a timeout.
+        """
         if parameter.type != ParameterType.COMMAND:
             raise ValueError(f"parameter={parameter.name!r} type={parameter.type.name} expected=COMMAND")
         origin = self.transport.origin(device_address)
 
-        def send(step: int) -> None:
+        def send(step: CommandStatus) -> None:
             self.transport.queue(make_extended_frame(FrameType.PARAMETER_WRITE, device_address, origin,
                                                      bytes([parameter.id, step])))
 
-        send(1)  # start
-        deadline = time.monotonic() + self.timeout_seconds
-        while time.monotonic() < deadline:
+        send(CommandStatus.START)
+        run_deadline = time.monotonic() + run_limit_seconds
+        while True:
             status = decode_parameter(
                 parameter.id,
-                self._read_chunks(device_address, parameter.id, FrameType.PARAMETER_WRITE, query_value=6))
-            if status.command_status == 0:  # READY: command finished
+                self._read_chunks(device_address, parameter.id, FrameType.PARAMETER_WRITE,
+                                  query_value=CommandStatus.POLL))
+            if status.command_status == CommandStatus.READY:
                 return status
-            if status.command_status == 3:  # CONFIRMATION_NEEDED
+            if status.command_status == CommandStatus.CONFIRMATION_NEEDED:
                 if not confirm:
                     raise RuntimeError(
                         f"parameter={parameter.name!r} needs confirmation: {status.command_info!r}")
-                send(4)
+                send(CommandStatus.CONFIRM)
+            elif time.monotonic() >= run_deadline:
+                send(CommandStatus.CANCEL)
+                raise TimeoutError(
+                    f"device=0x{device_address:02X} command={parameter.name!r} "
+                    f"still_running_after_s={run_limit_seconds} status={status.command_status} "
+                    f"info={status.command_info!r} sent=CANCEL")
             time.sleep((status.command_timeout or 10) / 100)
-        raise TimeoutError(f"device=0x{device_address:02X} command={parameter.name!r} "
-                           f"timeout_seconds={self.timeout_seconds}")
 
 
 def parameter_text(parameter: Parameter) -> str:

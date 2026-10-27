@@ -62,6 +62,9 @@ CONFIG_RESPONSE_LIMIT = 65507
 CONFIG_STATUS_INTERVAL_S = 1.0
 CONFIG_PARAMETER_TIMEOUT_S = 3.0
 CONFIG_DEVICE_DISCOVERY_S = 2.0
+# A COMMAND still reporting PROGRESS after this long is cancelled. Kept below
+# config_client.py's 60 s reply wait so the client always receives the outcome.
+CONFIG_COMMAND_RUN_LIMIT_S = 50.0
 
 
 def parameter_value(parameter: Parameter):
@@ -248,7 +251,8 @@ class ElrsConfigService:
             }
         if command == "command":
             result = self.client.command(
-                transmitter.address, parameter, bool(request.get("confirm", False)))
+                transmitter.address, parameter, bool(request.get("confirm", False)),
+                CONFIG_COMMAND_RUN_LIMIT_S)
             return {"parameter": parameter_dict(result)}
         raise ValueError(f"unknown configuration command {request['command']!r}")
 
