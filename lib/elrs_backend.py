@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""
+"""crsfproxy core and the ExpressLRS radio backend. Run crsfproxy.py.
+
 Usage:
-  python crsfproxy.py --device /dev/ttyUSB0 --baud 921600 --host 0.0.0.0 --port 60000 --loop_hz 250 --tx_rate 100 --telemetry_udp 192.168.4.2:40042 --config_udp 60001
+  python3 crsfproxy.py --device /dev/ttyUSB0 --baud 921600 --host 0.0.0.0 --port 60000 --loop_hz 250 --tx_rate 100 --telemetry_udp 192.168.4.2:40042 --config_udp 60001
 
 CRSF TX side bridge:
 - Listens on a UDP port for 40-byte RC packets: <uint32 t_ms><16 x uint16 us><uint32 crc32>.
@@ -11,9 +12,10 @@ CRSF TX side bridge:
 Telemetry output:
 - Optional raw CRSF frames to --telemetry_udp (host:port)
 
-ELRS configuration:
-- Optional JSON or shell-style Lua configuration commands on --config_udp.
-- Configuration is TX-only and uses the same DEVICE/PARAMETER protocol as elrs.lua.
+Configuration:
+- JSON or shell-style configuration commands on --config_udp (RC port + 1 by default).
+- The radio backend (lib/radio.py) executes them; ELRS_RADIO uses the same
+  DEVICE/PARAMETER protocol as elrs.lua.
 
 RC hold:
 - Disabled by default: each fresh UDP RC sample is forwarded once, subject to --tx_rate.
@@ -22,13 +24,13 @@ RC hold:
 - Actual RF/receiver/flight-controller failsafe logic remains downstream of crsfproxy.
 """
 
-import argparse
 import json
 import queue
 import shlex
 import socket
 import threading
 import time
+from dataclasses import dataclass
 
 import serial
 
@@ -40,6 +42,7 @@ from .crsf_protocol import (
     CRSF_SYNC,
     DeviceInfo,
     Frame as CrsfFrame,
+    FrameParser,
     FrameType,
     Parameter,
     ParameterType,
@@ -47,15 +50,14 @@ from .crsf_protocol import (
     make_extended_frame,
     make_rc_frame,
     unpack_channels,
-    validate_frame,
 )
 from .elrs_config import ParameterClient
+from .radio import RadioBackend
 from .rc_packet import RcPacket, RcPacketError
 from .schedule import DeadlineSchedule
 
 WRITE_TIMEOUT_S = 0.1
 DEFAULT_BAUD = 115200
-SERIAL_RX_HEADERS = (CRSF_SYNC, ELRS_ADDRESS_TRANSMITTER)
 CONFIG_RESPONSE_LIMIT = 65507
 CONFIG_STATUS_INTERVAL_S = 1.0
 CONFIG_PARAMETER_TIMEOUT_S = 3.0
@@ -175,7 +177,7 @@ class ProxyConfigTransport:
             }
 
 
-class ConfigService:
+class ElrsConfigService:
     """Execute one-shot Lua-style operations against the ELRS transmitter."""
 
     def __init__(self, transport: ProxyConfigTransport) -> None:
@@ -273,12 +275,11 @@ def parse_config_request(data: bytes) -> dict:
 
 
 class ConfigUdpServer(threading.Thread):
-    def __init__(self, host: str, port: int, transport: ProxyConfigTransport,
-                 debug: bool = False) -> None:
+    def __init__(self, host: str, port: int, service, debug: bool = False) -> None:
         super().__init__(name="config-udp", daemon=True)
         self.host = host
         self.port = port
-        self.transport = transport
+        self.service = service
         self.debug = debug
         self.stop_event = threading.Event()
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -287,7 +288,6 @@ class ConfigUdpServer(threading.Thread):
         self.socket.settimeout(0.1)
 
     def run(self) -> None:
-        service = ConfigService(self.transport)
         while not self.stop_event.is_set():
             try:
                 data, sender = self.socket.recvfrom(CONFIG_RESPONSE_LIMIT)
@@ -301,7 +301,7 @@ class ConfigUdpServer(threading.Thread):
                 if self.debug:
                     print(f"Config request sender={sender} command={request.get('command')!r}")
                 try:
-                    response = {"ok": True, "result": service.execute(request)}
+                    response = {"ok": True, "result": self.service.execute(request)}
                 except (KeyError, ValueError, TimeoutError, RuntimeError) as error:
                     response = {"ok": False, "error": f"{type(error).__name__}: {error}"}
             payload = json.dumps(response, separators=(",", ":")).encode("utf-8")
@@ -311,6 +311,19 @@ class ConfigUdpServer(threading.Thread):
         self.stop_event.set()
         self.join()
         self.socket.close()
+
+
+ELRS_RADIO = RadioBackend(
+    name="ELRS",
+    default_baud=DEFAULT_BAUD,
+    frame_addresses=frozenset((CRSF_SYNC, ELRS_ADDRESS_TRANSMITTER)),
+    transport_type=ProxyConfigTransport,
+    service_type=ElrsConfigService,
+    # Empty PARAMETER_WRITE from the Lua address: asks the TX for ELRS_STATUS.
+    status_poll_frame=make_extended_frame(
+        FrameType.PARAMETER_WRITE, ELRS_ADDRESS_TRANSMITTER, CRSF_ADDRESS_ELRS_LUA, bytes([0, 0])),
+)
+
 
 def signed_byte(b: int) -> int:
     return b - 256 if b >= 128 else b
@@ -436,39 +449,33 @@ def handleCrsfPacket(ptype: int, data: bytes, verbose=False):
         print(f"Telemetry UNKNOWN type=0x{ptype:02x} raw={data.hex()}")
     return out
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--host', default='0.0.0.0', required=False, help="UDP bind host for RC packets")
-    parser.add_argument('--port', type=int, default=60000, required=False, help="UDP port for RC packets")
-    parser.add_argument('--device', default='/dev/ttyUSB0', required=False,
-                        help="Serial device or pySerial URL, e.g. socket://127.0.0.1:5762")
-    parser.add_argument('--baud', type=int, default=DEFAULT_BAUD, required=False, help="CRSF serial baudrate")
-    parser.add_argument('--tx_rate', type=float, default=100.0, help="Maximum RC frame rate Hz")
-    parser.add_argument('--loop_hz', type=float, default=250.0, help="Max main loop rate Hz")
-    parser.add_argument('--rc-hold-ms', type=int, default=0, metavar='MS',
-                        help="Repeat the latest RC sample for up to MS after input stops; 0 disables hold (default)")
-    parser.add_argument('--telemetry_udp', help="Send raw CRSF telemetry frames to host:port (e.g. MWP)")
-    parser.add_argument('--config_udp', type=int, help="UDP port for TX elrs.lua configuration commands")
-    parser.add_argument('--debug', action='store_true', help="Verbose RC/telemetry logging")
-    args = parser.parse_args()
+@dataclass(frozen=True)
+class ProxyOptions:
+    """Validated settings for one proxy; crsfproxy.py builds this from its arguments."""
+    host: str
+    port: int
+    device: str
+    baud: int
+    tx_rate: float
+    loop_hz: float
+    rc_hold_ms: int
+    telemetry_udp: tuple[str, int] | None
+    config_udp: int
+    debug: bool
 
-    if args.rc_hold_ms < 0:
-        parser.error('--rc-hold-ms must be >= 0')
-    if not args.tx_rate > 0:
-        parser.error('--tx_rate must be > 0')
 
-    HOST = args.host
-    PORT = args.port
-    loop_hz = float(args.loop_hz)
-    loop_period = 1.0 / loop_hz
-    rc_hold_ms = int(args.rc_hold_ms)
+def run_proxy(options: ProxyOptions, radio: RadioBackend) -> None:
+    HOST = options.host
+    PORT = options.port
+    loop_period = 1.0 / options.loop_hz
+    rc_hold_ms = options.rc_hold_ms
 
     print(f"Listening for UDP RC on {HOST}:{PORT}")
     print("RC hold disabled" if rc_hold_ms == 0 else f"RC hold {rc_hold_ms} ms")
 
     # Open a local serial device or pySerial URL without asserting modem control lines.
-    ser = serial.serial_for_url(args.device, do_not_open=True)
-    ser.baudrate = args.baud
+    ser = serial.serial_for_url(options.device, do_not_open=True)
+    ser.baudrate = options.baud
     ser.timeout = 0
     ser.write_timeout = WRITE_TIMEOUT_S
     ser.bytesize = serial.EIGHTBITS
@@ -482,17 +489,17 @@ def main():
     ser.open()
     ser.reset_input_buffer()
     ser.reset_output_buffer()
-    if args.debug:
+    if options.debug:
         print(
-            f"Opened serial device={args.device} "
-            f"baud_request={args.baud} "
+            f"Opened serial device={options.device} "
+            f"baud_request={options.baud} "
             f"baud_open={ser.baudrate} "
             f"timeout={ser.timeout} "
             f"write_timeout={ser.write_timeout} "
             f"rts={ser.rts} "
             f"dtr={ser.dtr}"
         )
-    input_buf = bytearray()
+    frame_parser = FrameParser(radio.frame_addresses)
 
     # UDP socket for RC input
     rc_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -503,25 +510,20 @@ def main():
     # Optional UDP socket for telemetry (raw CRSF frames)
     tele_sock = None
     tele_target = None
-    if args.telemetry_udp is not None:
-        if ":" not in args.telemetry_udp:
-            raise ValueError("telemetry_udp must be host:port")
-        host, port_s = args.telemetry_udp.rsplit(":", 1)
-        tele_target = (host, int(port_s))
+    if options.telemetry_udp is not None:
+        tele_target = options.telemetry_udp
         tele_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         tele_sock.setblocking(False)
         print(f"Telemetry UDP target {tele_target}")
-        if args.debug:
+        if options.debug:
             print("Debug telemetry forwarding enabled")
 
-    config_transport = None
-    config_server = None
     next_config_status_t = 0.0
-    if args.config_udp is not None:
-        config_transport = ProxyConfigTransport()
-        config_server = ConfigUdpServer(HOST, args.config_udp, config_transport, args.debug)
-        config_server.start()
-        print(f"ELRS configuration UDP listening on {HOST}:{args.config_udp}")
+    config_transport = radio.transport_type()
+    config_server = ConfigUdpServer(
+        HOST, options.config_udp, radio.service_type(config_transport), options.debug)
+    config_server.start()
+    print(f"{radio.name} configuration UDP listening on {HOST}:{options.config_udp}")
 
     last_rc_sender = None
     last_rc_update_t = 0.0
@@ -530,7 +532,7 @@ def main():
     last_sent_rc_seq = 0
     last_control_state = None
     last_tx_debug_t = 0.0
-    rc_schedule = DeadlineSchedule(args.tx_rate, time.monotonic())
+    rc_schedule = DeadlineSchedule(options.tx_rate, time.monotonic())
 
     try:
         while True:
@@ -548,7 +550,7 @@ def main():
                 except RcPacketError as error:
                     print(f"RC packet rejected sender={sender} {error}")
                     continue
-                if args.debug and sender != last_rc_sender:
+                if options.debug and sender != last_rc_sender:
                     print(f"Receiving RC from {sender} ch0-3={ch[:4]} ch4-7={ch[4:8]}")
                 last_valid_channels_us = ch
                 last_rc_update_t = now
@@ -559,94 +561,54 @@ def main():
             try:
                 waiting = ser.in_waiting
             except OSError as e:
-                print(f"Serial in_waiting failed port={args.device} baud={args.baud} err={e}")
+                print(f"Serial in_waiting failed port={options.device} baud={options.baud} err={e}")
                 raise
+            frames = []
             if waiting > 0:
                 try:
                     chunk = ser.read(waiting)
                 except OSError as e:
-                    print(f"Serial read failed port={args.device} baud={args.baud} waiting={waiting} err={e}")
+                    print(f"Serial read failed port={options.device} baud={options.baud} waiting={waiting} err={e}")
                     raise
                 if chunk.startswith(b"$X"):
                     # Some devices prepend 8 bytes of junk
                     chunk = chunk[8:]
-                input_buf.extend(chunk)
-                if args.debug and len(chunk) > 0:
+                discarded_before = frame_parser.bytes_discarded
+                crc_errors_before = frame_parser.crc_errors
+                frames = frame_parser.feed(chunk)
+                if options.debug and len(chunk) > 0:
                     print(
                         f"Serial rx chunk_len={len(chunk)} "
-                        f"buffer_len={len(input_buf)} "
+                        f"buffer_len={len(frame_parser.buffer)} "
                         f"chunk_hex={chunk.hex()}"
                     )
-
-            # Parse CRSF frames from buffer
-            while len(input_buf) > 2:
-                if input_buf[0] not in SERIAL_RX_HEADERS:
-                    sync_index = -1
-                    for header_byte in SERIAL_RX_HEADERS:
-                        header_index = input_buf.find(bytes((header_byte,)))
-                        if header_index != -1 and (sync_index == -1 or header_index < sync_index):
-                            sync_index = header_index
-                    if sync_index == -1:
-                        if args.debug:
-                            print(
-                                f"Serial discard reason=no_sync "
-                                f"discard_len={len(input_buf)} "
-                                f"discard_hex={bytes(input_buf).hex()}"
-                            )
-                        input_buf.clear()
-                        break
-                    if args.debug and sync_index > 0:
-                        print(
-                            f"Serial discard reason=resync "
-                            f"discard_len={sync_index} "
-                            f"discard_hex={bytes(input_buf[:sync_index]).hex()}"
-                        )
-                    del input_buf[:sync_index]
-                    if len(input_buf) <= 2:
-                        break
-                expected_len = input_buf[1] + 2  # length includes type..crc, plus sync+len here
-                if expected_len > 64 or expected_len < 4:
-                    if args.debug:
-                        print(
-                            f"Serial discard reason=bad_len "
-                            f"len_byte={input_buf[1]} "
-                            f"buffer_len={len(input_buf)} "
-                            f"buffer_hex={bytes(input_buf).hex()}"
-                        )
-                    del input_buf[0]
-                    continue
-                if len(input_buf) < expected_len:
-                    break
-                frame = bytes(input_buf[:expected_len])
-                del input_buf[:expected_len]
-                if not validate_frame(frame):
-                    if args.debug:
-                        print(
-                            f"Serial discard reason=crc_error "
-                            f"frame_len={len(frame)} "
-                            f"type=0x{frame[2]:02x} "
-                            f"frame_hex={frame.hex()}"
-                        )
-                    continue
-                if args.debug:
+                if options.debug and frame_parser.bytes_discarded != discarded_before:
                     print(
-                        f"Serial frame_header=0x{frame[0]:02x} "
-                        f"Serial frame_ok len={len(frame)} "
-                        f"type=0x{frame[2]:02x} "
-                        f"frame_hex={frame.hex()}"
+                        f"Serial discard "
+                        f"discard_len={frame_parser.bytes_discarded - discarded_before} "
+                        f"crc_errors={frame_parser.crc_errors - crc_errors_before} "
+                        f"(bytes are in the chunk_hex above)"
                     )
-                if config_transport is not None:
-                    config_transport.observe(
-                        CrsfFrame(frame[0], frame[2], frame[3:-1], frame))
+
+            # Handle complete, CRC-valid CRSF frames
+            for frame in frames:
+                if options.debug:
+                    print(
+                        f"Serial frame_header=0x{frame.address:02x} "
+                        f"Serial frame_ok len={len(frame.raw)} "
+                        f"type=0x{frame.type:02x} "
+                        f"frame_hex={frame.raw.hex()}"
+                    )
+                config_transport.observe(frame)
                 if tele_sock is not None:
                     try:
-                        tele_sock.sendto(frame, tele_target)
-                        if args.debug:
-                            print(f"Sent telemetry frame len={len(frame)} type=0x{frame[2]:02x} to {tele_target}")
+                        tele_sock.sendto(frame.raw, tele_target)
+                        if options.debug:
+                            print(f"Sent telemetry frame len={len(frame.raw)} type=0x{frame.type:02x} to {tele_target}")
                     except BlockingIOError:
                         pass
-                pkt = handleCrsfPacket(frame[2], frame, verbose=args.debug)
-                if args.debug and pkt is not None:
+                pkt = handleCrsfPacket(frame.type, frame.raw, verbose=options.debug)
+                if options.debug and pkt is not None:
                     ptype = pkt.get("type")
                     if ptype == "LINK_STATISTICS":
                         print(f"TEL LINK rssi1={pkt['rssi1']} rssi2={pkt['rssi2']} lq={pkt['lq']} snr={pkt['snr']} pwr={pkt['power']} down_rssi={pkt['downlink_rssi']} down_lq={pkt['downlink_lq']} down_snr={pkt['downlink_snr']}")
@@ -671,13 +633,8 @@ def main():
 
             # Send fresh RC, or optionally hold the latest sample for a short gap.
             if rc_schedule.due(now):
-                if config_transport is not None and now >= next_config_status_t:
-                    config_transport.queue(make_extended_frame(
-                        FrameType.PARAMETER_WRITE,
-                        ELRS_ADDRESS_TRANSMITTER,
-                        CRSF_ADDRESS_ELRS_LUA,
-                        bytes([0, 0]),
-                    ))
+                if radio.status_poll_frame is not None and now >= next_config_status_t:
+                    config_transport.queue(radio.status_poll_frame)
                     next_config_status_t = now + CONFIG_STATUS_INTERVAL_S
 
                 elapsed_ms = (now - last_rc_update_t) * 1000.0
@@ -693,7 +650,7 @@ def main():
                 else:
                     control_state = 'rc_idle'
 
-                if args.debug and control_state != last_control_state:
+                if options.debug and control_state != last_control_state:
                     line = (
                         f"RC state={control_state} "
                         f"sender={last_rc_sender} "
@@ -704,7 +661,7 @@ def main():
                     print(line)
                     last_control_state = control_state
 
-                if args.debug and (now - last_tx_debug_t) >= 0.5:
+                if options.debug and (now - last_tx_debug_t) >= 0.5:
                     line = f"Serial tx state={control_state} elapsed_ms={elapsed_ms:.1f}"
                     if active is not None:
                         line += f" ch0-3={active[:4]} ch4-7={active[4:8]}"
@@ -712,14 +669,13 @@ def main():
                     last_tx_debug_t = now
 
                 rc_frame = make_rc_frame(active) if active is not None else b''
-                control_frames = config_transport.drain_outbound() \
-                    if config_transport is not None else []
+                control_frames = config_transport.drain_outbound()
                 burst = rc_frame + b''.join(control_frames)
                 try:
                     written = ser.write(burst) if burst else 0
                     if rc_frame:
                         last_sent_rc_seq = rc_update_seq
-                    if args.debug:
+                    if options.debug:
                         rc_type = f"0x{rc_frame[2]:02x}" if rc_frame else 'none'
                         print(
                             f"Serial tx rc_frame_len={len(rc_frame)} control_frames={len(control_frames)} "
@@ -728,7 +684,7 @@ def main():
                             + (f" frame_hex={rc_frame.hex()}" if rc_frame else '')
                         )
                 except serial.SerialTimeoutException as e:
-                    print(f"Serial write timeout port={args.device} baud={args.baud} burst_len={len(burst)} elapsed_ms={elapsed_ms:.1f} err={e}")
+                    print(f"Serial write timeout port={options.device} baud={options.baud} burst_len={len(burst)} elapsed_ms={elapsed_ms:.1f} err={e}")
 
             loop_elapsed = time.monotonic() - loop_start
             if loop_elapsed < loop_period:
@@ -741,8 +697,7 @@ def main():
             rc_sock.close()
         except OSError:
             pass
-        if config_server is not None:
-            config_server.close()
+        config_server.close()
         try:
             ser.close()
         except OSError:
@@ -752,6 +707,3 @@ def main():
                 tele_sock.close()
             except OSError:
                 pass
-
-if __name__ == "__main__":
-    main()

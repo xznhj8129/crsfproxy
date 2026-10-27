@@ -24,14 +24,13 @@ issued, matching the official mLRS Lua configurator.
 
 from __future__ import annotations
 
-import builtins
-import sys
 import time
 from collections import deque
 from dataclasses import dataclass
 from enum import IntEnum
 
 from . import elrs_backend as base
+from .radio import RadioBackend
 from .crsf_protocol import (
     CRSF_ADDRESS_RADIO_TRANSMITTER,
     CRSF_ADDRESS_RECEIVER,
@@ -284,10 +283,6 @@ def _parameter_value(parameter: Parameter):
 
 class MlrsConfigTransport(base.ProxyConfigTransport):
     """Use crsfproxy's scheduled serial writes for mBridge-over-CRSF traffic."""
-
-    def queue(self, frame: bytes) -> None:
-        if frame:
-            self.outbound.put(frame)
 
     def observe(self, frame: Frame) -> None:
         if frame.type == MLRS_CRSF_TO_RADIO:
@@ -837,57 +832,12 @@ class MlrsConfigService:
         raise ValueError(f"unknown configuration command {request['command']!r}")
 
 
-def _suppress_elrs_status_frame(frame_type, destination, origin, payload=b"") -> bytes:
-    """crsfproxy periodically asks ELRS for status; mLRS neither needs nor uses it."""
-    if (
-        frame_type == base.FrameType.PARAMETER_WRITE
-        and destination == base.ELRS_ADDRESS_TRANSMITTER
-        and origin == base.CRSF_ADDRESS_ELRS_LUA
-        and payload == bytes([0, 0])
-    ):
-        return b""
-    return _ORIGINAL_MAKE_EXTENDED_FRAME(frame_type, destination, origin, payload)
-
-
-def _proxy_print(*args, **kwargs) -> None:
-    if args and isinstance(args[0], str):
-        first = args[0].replace(
-            "ELRS configuration UDP listening",
-            "mLRS configuration UDP listening",
-        )
-        args = (first,) + args[1:]
-    builtins.print(*args, **kwargs)
-
-
-def _patch_crsfproxy() -> None:
-    base.ProxyConfigTransport = MlrsConfigTransport
-    base.ConfigService = MlrsConfigService
-    base.make_extended_frame = _suppress_elrs_status_frame
-    base.SERIAL_RX_HEADERS = tuple(dict.fromkeys(
-        tuple(base.SERIAL_RX_HEADERS) + (CRSF_ADDRESS_RADIO_TRANSMITTER,)
-    ))
-    base.print = _proxy_print
-
-
-def _apply_mlrs_defaults(argv: list[str]) -> None:
-    has_baud = any(arg == "--baud" or arg.startswith("--baud=") for arg in argv[1:])
-    if not has_baud:
-        argv.extend(["--baud", "400000"])
-
-
-_ORIGINAL_MAKE_EXTENDED_FRAME = base.make_extended_frame
-
-
-def activate(argv: list[str]) -> None:
-    _patch_crsfproxy()
-    _apply_mlrs_defaults(argv)
-
-
-def main() -> int:
-    activate(sys.argv)
-    base.main()
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
+MLRS_RADIO = RadioBackend(
+    name="mLRS",
+    default_baud=400000,  # the only rate mLRS supports on its radio-side CRSF port
+    # mLRS replies are addressed to the radio transmitter (0xEA).
+    frame_addresses=base.ELRS_RADIO.frame_addresses | {CRSF_ADDRESS_RADIO_TRANSMITTER},
+    transport_type=MlrsConfigTransport,
+    service_type=MlrsConfigService,
+    status_poll_frame=None,  # mLRS neither needs nor uses the ELRS status poll
+)

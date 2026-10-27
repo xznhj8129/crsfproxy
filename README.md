@@ -290,7 +290,7 @@ Every response is JSON:
 
 ## 📻 Radio selection
 
-`--radio` selects only the transmitter-module configuration backend. The RC bridge, telemetry forwarding, serial scheduling and UDP configuration API are shared.
+`--radio` selects a radio backend (`lib/radio.py`): its configuration transport and service, its default baud, which first bytes start an inbound serial frame, and whether the ELRS status poll is sent. The RC bridge, telemetry forwarding, serial scheduling and frame parsing, and the UDP configuration API are shared.
 
 ### ExpressLRS
 
@@ -380,7 +380,7 @@ Full documentation: [`SITL_RECEIVER.md`](SITL_RECEIVER.md). Two-receiver launch 
 | `--loop_hz` | `250` | Max main loop rate (Hz) — caps main-loop CPU |
 | `--rc-hold-ms` | `0` | Repeat the latest RC sample for up to this many ms after input stops; `0` disables hold |
 | `--telemetry_udp` | — | Send raw CRSF telemetry to `host:port` (e.g. MWP) |
-| `--config_udp` | RC port + 1 | UDP port for TX `elrs.lua` configuration commands |
+| `--config_udp` | RC port + 1 | UDP port for TX configuration commands |
 | `--debug` | off | Verbose serial/RC/telemetry logging |
 
 ## 📝 Notes & gotchas
@@ -414,8 +414,9 @@ crsf_rx_sim.py        virtual CRSF receiver for INAV SITL
 
 lib/
     __init__.py
-    elrs_backend.py   proxy core + ExpressLRS configuration service
-    mlrs_backend.py   mLRS mBridge configuration backend
+    radio.py          radio backend contract (what --radio selects)
+    elrs_backend.py   proxy core + ExpressLRS radio backend (ELRS_RADIO)
+    mlrs_backend.py   mLRS mBridge radio backend (MLRS_RADIO)
     elrs_config.py    ELRS device-parameter protocol client
     crsf_protocol.py  CRSF frame codec
     rc_packet.py      the 40-byte UDP RC packet

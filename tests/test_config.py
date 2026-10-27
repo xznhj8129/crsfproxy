@@ -7,7 +7,7 @@ from lib.crsf_protocol import (
     Parameter,
     ParameterType,
 )
-from lib.elrs_backend import ConfigService, ProxyConfigTransport, parse_config_request
+from lib.elrs_backend import ElrsConfigService, ProxyConfigTransport, parse_config_request
 
 
 class FakeClient:
@@ -62,7 +62,7 @@ class ConfigTests(unittest.TestCase):
                       value=0, options=("333Hz",)),
             Parameter(3, 0, ParameterType.INFO, False, "Git Hash", value="abc123"),
         ]
-        service = ConfigService(transport)
+        service = ElrsConfigService(transport)
         service.client = FakeClient(device, parameters)
         result = service.execute({"command": "info"})
         self.assertEqual(result["device"]["version"], "4.1.2")
@@ -84,7 +84,7 @@ class ConfigTests(unittest.TestCase):
         parameter = Parameter(
             1, 0, ParameterType.SELECTION, False, "Packet Rate",
             value=0, options=("250Hz",))
-        service = ConfigService(transport)
+        service = ElrsConfigService(transport)
         service.client = FakeClient(device, [parameter])
         result = service.execute({"command": "params"})
         self.assertEqual(result["binding"]["message"], "Baud rate too low")

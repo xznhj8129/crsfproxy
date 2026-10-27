@@ -135,7 +135,9 @@ def validate_frame(raw: bytes) -> bool:
 
 
 class FrameParser:
-    def __init__(self) -> None:
+    def __init__(self, addresses: frozenset[int] = frozenset(CRSF_KNOWN_ADDRESSES)) -> None:
+        """addresses: first bytes accepted as the start of a frame."""
+        self.addresses = addresses
         self.buffer = bytearray()
         self.bytes_discarded = 0
         self.crc_errors = 0
@@ -144,7 +146,7 @@ class FrameParser:
         self.buffer.extend(data)
         frames: list[Frame] = []
         while len(self.buffer) >= 4:
-            if self.buffer[0] not in CRSF_KNOWN_ADDRESSES:
+            if self.buffer[0] not in self.addresses:
                 del self.buffer[0]
                 self.bytes_discarded += 1
                 continue
