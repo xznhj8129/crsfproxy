@@ -4,7 +4,7 @@ import time
 import unittest
 import zlib
 
-from crsf_protocol import FrameParser, FrameType
+from lib.crsf_protocol import FrameParser, FrameType
 from crsf_rx_sim import (
     DEFAULT_FAILSAFE_CHANNELS_US,
     LinkStatistics,

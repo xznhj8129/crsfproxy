@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-from crsf_protocol import (
+from lib.crsf_protocol import (
     CRSF_ADDRESS_FLIGHT_CONTROLLER,
     FrameParser,
     FrameType,
