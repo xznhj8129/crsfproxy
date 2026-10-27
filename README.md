@@ -454,3 +454,11 @@ python3 -m unittest discover -s tests -v
 ## 📄 License
 
 [GPL-3.0](LICENSE), the same as ExpressLRS.
+
+
+## Attribution
+
+- Yours truly
+- Claude Fable 5, Opus 5.5
+- Deepseek 4.1 Flash, Flash 1017
+- Codex Sol 5.6
