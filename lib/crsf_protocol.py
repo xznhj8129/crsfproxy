@@ -226,16 +226,6 @@ def make_rc_frame(channels_us: list[int]) -> bytes:
     return make_frame(FrameType.RC_CHANNELS_PACKED, pack_channels_us(channels_us))
 
 
-def make_battery_frame(voltage_decivolts: int, current_deciamps: int, capacity_mah: int, remaining_percent: int) -> bytes:
-    payload = (
-        voltage_decivolts.to_bytes(2, "big")
-        + current_deciamps.to_bytes(2, "big")
-        + capacity_mah.to_bytes(3, "big")
-        + bytes([remaining_percent])
-    )
-    return make_frame(FrameType.BATTERY_SENSOR, payload)
-
-
 def parse_device_info(frame: Frame) -> DeviceInfo:
     data = frame.extended_payload
     end = data.index(0)

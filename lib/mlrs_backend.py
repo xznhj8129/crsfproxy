@@ -1,22 +1,22 @@
 #!/usr/bin/env python3
 """mLRS backend for crsfproxy (selected with crsfproxy.py --radio mlrs).
 
-This keeps crsfproxy's UDP RC, CRSF serial, RC hold, and telemetry forwarding
-logic unchanged while replacing the ExpressLRS parameter service with mLRS's
-mBridge-over-CRSF configurator protocol.
+This keeps crsfproxy's protocol v1 RC, CRSF serial, RC hold, and telemetry
+forwarding logic unchanged while replacing the ExpressLRS parameter service
+with mLRS's mBridge-over-CRSF configurator protocol.
 
 Usage is the same as crsfproxy.py. mLRS only supports 400000 baud on the radio
 CRSF interface, so this backend supplies 400000 when --baud is not specified.
 
 Example:
   python3 crsfproxy.py --radio mlrs --device /dev/ttyUSB0 \
-      --telemetry_udp 127.0.0.1:40042
+      --telemetry 127.0.0.1:40042
 
 The existing config_client.py can then be used for info/params/get/set and
 synthetic command parameters such as Save and Bind:
-  python3 config_client.py --port 60001 params
-  python3 config_client.py --port 60001 set "Tx Ch Source" crsf
-  python3 config_client.py --port 60001 command Save --confirm
+  python3 config_client.py params
+  python3 config_client.py set "Tx Ch Source" crsf
+  python3 config_client.py command Save --confirm
 
 mLRS parameter writes are live changes. They are not persisted until Save is
 issued, matching the official mLRS Lua configurator.
@@ -29,12 +29,13 @@ from collections import deque
 from dataclasses import dataclass, replace
 from enum import IntEnum
 
-from . import elrs_backend as base
+from . import config, transport
 from .radio import RadioBackend
 from .crsf_protocol import (
     CRSF_ADDRESS_RADIO_TRANSMITTER,
     CRSF_ADDRESS_RECEIVER,
     CRSF_ADDRESS_TRANSMITTER,
+    CRSF_SYNC,
     CommandStatus,
     Frame,
     Parameter,
@@ -278,11 +279,7 @@ def _mask_is_editable(mask: int) -> bool:
     return mask != 0 and (mask & (mask - 1)) != 0
 
 
-def _parameter_value(parameter: Parameter):
-    return base.parameter_value(parameter)
-
-
-class MlrsConfigTransport(base.ProxyConfigTransport):
+class MlrsConfigTransport(transport.ProxyConfigTransport):
     """Use crsfproxy's scheduled serial writes for mBridge-over-CRSF traffic."""
 
     def observe(self, frame: Frame) -> None:
@@ -296,7 +293,8 @@ class MlrsConfigTransport(base.ProxyConfigTransport):
 class MlrsClient:
     """mBridge command client carried in mLRS CRSF frame types 0x81/0x82."""
 
-    def __init__(self, transport: MlrsConfigTransport, timeout_seconds: float = 3.0) -> None:
+    def __init__(self, transport: MlrsConfigTransport,
+                 timeout_seconds: float = config.DEFAULT_PARAMETER_TIMEOUT_S) -> None:
         self.transport = transport
         self.timeout_seconds = timeout_seconds
         self.pending: deque[MlrsWireCommand] = deque()
@@ -762,92 +760,124 @@ class MlrsClient:
 
 
 class MlrsConfigService:
-    """Expose mLRS configuration through crsfproxy's existing UDP JSON API."""
+    """Expose mLRS configuration through the protocol v1 CONTROL API."""
 
     def __init__(self, transport: MlrsConfigTransport) -> None:
         self.transport = transport
-        self.client = MlrsClient(transport, base.CONFIG_PARAMETER_TIMEOUT_S)
+        self.client = MlrsClient(transport, config.DEFAULT_PARAMETER_TIMEOUT_S)
 
     @staticmethod
-    def _record_dict(record: MlrsParameterRecord) -> dict:
-        result = base.parameter_dict(record.parameter)
+    def _record_dict(record: MlrsParameterRecord, compact: bool = False) -> dict:
+        result = config.parameter_dict(record.parameter, compact=compact)
         result["editable"] = record.editable
         if record.mlrs_type is not None:
             result["mlrs_type"] = record.mlrs_type.name
             result["allowed_mask"] = f"0x{record.allowed_mask:04X}"
         return result
 
-    def _summary_result(self, summary: MlrsSummary) -> dict:
-        result = {
-            "protocol": "mlrs",
-            "device": summary.tx.as_dict(summary.info.parameter_count),
-            "binding": summary.info.status_dict(),
-            "mlrs": summary.info.as_dict(),
-        }
+    @staticmethod
+    def _device(summary: MlrsSummary) -> dict:
+        return summary.tx.as_dict(summary.info.parameter_count)
+
+    @staticmethod
+    def _mlrs_dict(summary: MlrsSummary) -> dict:
+        result = summary.info.as_dict()
         if summary.rx is not None:
-            result["mlrs"]["rx_device"] = summary.rx.as_dict(summary.info.parameter_count)
+            result["rx_device"] = summary.rx.as_dict(summary.info.parameter_count)
         return result
+
+    @staticmethod
+    def _offset(request: dict) -> int:
+        try:
+            return int(request.get("offset", 0))
+        except (TypeError, ValueError) as error:
+            raise ValueError(f"offset={request.get('offset')!r} must be an integer") from error
+
+    def _params(self, request: dict) -> dict:
+        offset = self._offset(request)
+        if offset < 0:
+            raise ValueError(f"offset={offset} must be >= 0")
+        records = self.client.read_all(force=(offset == 0), include_commands=True)
+        summary = self.client.request_info()
+        page, more = config.paginate(
+            records, offset,
+            lambda record: self._record_dict(record, compact=True))
+        return {
+            "protocol": "mlrs",
+            "device": self._device(summary),
+            "parameters": page,
+            "offset": offset,
+            "total": len(records),
+            "more": more,
+            "radio_rate_hz": None,
+            "binding": None,
+            "mlrs": self._mlrs_dict(summary),
+        }
+
+    def _info(self) -> dict:
+        records = self.client.read_all(include_commands=False)
+        summary = self.client.request_info()
+        values = {
+            record.parameter.name: config.parameter_value(record.parameter)
+            for record in records
+            if record.parameter.value is not None
+        }
+        return {
+            "protocol": "mlrs",
+            "device": self._device(summary),
+            "current_band": values.get("RF Band") or values.get("Tx RF Band"),
+            "packet_rate": values.get("Mode") or values.get("Tx Mode"),
+            "mode": values.get("Mode") or values.get("Tx Mode"),
+            "model_id": summary.info.tx_config_id,
+            "telemetry_ratio": None,
+            "firmware_hash": None,
+            "radio_rate_hz": None,
+            "binding": None,
+            "mlrs": self._mlrs_dict(summary),
+        }
 
     def execute(self, request: dict) -> dict:
         command = request["command"].casefold()
 
         if command == "devices":
             summary = self.client.request_info(force=True)
-            devices = [summary.tx.as_dict(summary.info.parameter_count)]
+            devices = [self._device(summary)]
             if summary.rx is not None:
                 devices.append(summary.rx.as_dict(summary.info.parameter_count))
             return {"protocol": "mlrs", "devices": devices}
 
-        if command in ("params", "info"):
-            records = self.client.read_all(force=True, include_commands=(command == "params"))
-            summary = self.client.request_info()
-            result = self._summary_result(summary)
-            if command == "params":
-                result["parameters"] = [self._record_dict(record) for record in records]
-                return result
-
-            values = {
-                record.parameter.name: _parameter_value(record.parameter)
-                for record in records
-                if record.parameter.value is not None
-            }
-            result.update({
-                "current_band": values.get("RF Band") or values.get("Tx RF Band"),
-                "packet_rate": values.get("Mode") or values.get("Tx Mode"),
-                "mode": values.get("Mode") or values.get("Tx Mode"),
-                "model_id": summary.info.tx_config_id,
-                "telemetry_ratio": None,
-                "firmware_hash": None,
-                "configuration": values,
-                "lua_info": {},
-            })
-            return result
+        if command == "params":
+            return self._params(request)
+        if command == "info":
+            return self._info()
 
         record = self.client.find(str(request["parameter"]))
         if command == "get":
             return {"protocol": "mlrs", "parameter": self._record_dict(record)}
         if command == "set":
-            result = self.client.write(record, str(request["value"]))
-            updated_record = MlrsParameterRecord(
-                parameter=result.parameter,
-                mlrs_type=record.mlrs_type,
-                allowed_mask=record.allowed_mask,
-                raw_options=record.raw_options,
-                editable=record.editable,
-            )
+            try:
+                result = self.client.write(record, str(request["value"]))
+            finally:
+                self.client.parameter_cache = None
+                self.client.summary = None
             return {
                 "protocol": "mlrs",
                 "verified": result.verified,
                 "old_value": result.old_value,
-                "parameter": self._record_dict(updated_record),
+                "parameter": self._record_dict(replace(record, parameter=result.parameter)),
                 "persisted": False,
                 "note": "Run command Save to persist mLRS parameter changes",
             }
         if command == "command":
-            parameter = self.client.command_step(record, base.command_step_from_request(request))
+            try:
+                parameter = self.client.command_step(
+                    record, config.command_step_from_request(request))
+            finally:
+                self.client.parameter_cache = None
+                self.client.summary = None
             return {
                 "protocol": "mlrs",
-                "parameter": base.parameter_dict(parameter),
+                "parameter": self._record_dict(replace(record, parameter=parameter)),
             }
         raise ValueError(f"unknown configuration command {request['command']!r}")
 
@@ -856,7 +886,8 @@ MLRS_RADIO = RadioBackend(
     name="mLRS",
     default_baud=400000,  # the only rate mLRS supports on its radio-side CRSF port
     # mLRS replies are addressed to the radio transmitter (0xEA).
-    frame_addresses=base.ELRS_RADIO.frame_addresses | {CRSF_ADDRESS_RADIO_TRANSMITTER},
+    frame_addresses=frozenset((
+        CRSF_SYNC, CRSF_ADDRESS_TRANSMITTER, CRSF_ADDRESS_RADIO_TRANSMITTER)),
     transport_type=MlrsConfigTransport,
     service_type=MlrsConfigService,
     status_poll_frame=None,  # mLRS neither needs nor uses the ELRS status poll

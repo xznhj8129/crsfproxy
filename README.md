@@ -1,462 +1,340 @@
-<div align="center">
+# crsfproxy
 
-# 📡 crsfproxy
+A UDP server that owns one CRSF device and exposes it to the network.
 
-**UDP ⇄ CRSF serial bridge for RC control, telemetry, and remote ExpressLRS / mLRS configuration**
+`crsfproxy` sits between an IP network and one CRSF endpoint — normally an
+ExpressLRS or mLRS transmitter module. Clients send CRSF frames over UDP; the
+server writes them to the module and sends the module's frames back. RC is one
+CRSF frame type. Configuration is a JSON request/reply layer on the same port.
+The server does not interpret channel values and never generates them.
 
-[![Version](https://img.shields.io/badge/version-0.3-informational)](#-version-compatibility)
-[![Python](https://img.shields.io/badge/python-3.x-3776AB?logo=python&logoColor=white)](https://www.python.org/)
-[![Protocol](https://img.shields.io/badge/protocol-CRSF-orange)](https://github.com/tbs-fpv/tbs-crsf-spec/blob/main/crsf.md)
-[![ExpressLRS](https://img.shields.io/badge/ExpressLRS-4.0.1-blueviolet)](https://www.expresslrs.org/)
-[![mLRS](https://img.shields.io/badge/mLRS-mBridge-blue)](#mlrs)
-[![Dependencies](https://img.shields.io/badge/deps-pyserial%20%2B%20pygame-brightgreen)](#-install)
+> **Status:** crsfproxy v0.4 implements protocol v1. The contract is
+> [`PROTOCOL.md`](PROTOCOL.md). The v0.3 wire formats are listed under
+> [Changes from v0.3](#changes-from-v03).
 
-*Fly your quad from anything that can send a UDP packet — and configure your TX module over the network, no handset screen required.*
-
-> **Verified against ExpressLRS 4.0.1.** The wire protocol is stable across releases, but the configuration feature is only tested against this version — see [Version compatibility](#-version-compatibility).
-
-</div>
-
----
-
-## ✨ What it does
-
-`crsfproxy` sits between a UDP RC client (`udp_crsf` format) and a CRSF serial port, and does three jobs at once:
-
-| | Feature | Description |
-|---|---|---|
-| 🎮 | **RC bridge** | Receives UDP RC packets and sends CRSF `RC_CHANNELS_PACKED` frames to the transmitter, at most `--tx_rate` per second |
-| 📊 | **Telemetry forwarding** | Forwards inbound CRSF telemetry frames over UDP, unchanged — plugs straight into [MWP](https://github.com/stronnag/mwptools) |
-| 🛠️ | **Remote TX configuration** | Speaks the TX module's own configuration protocol directly (ExpressLRS device-parameter protocol, or mLRS mBridge-over-CRSF), exposing its live configuration table on a second UDP port for `config_client.py`. No `elrs.lua`, no handset — see [why](#-no-elrslua-required) |
-
-The repository also ships [`crsf_rx_sim.py`](#-virtual-crsf-receiver-for-inav-sitl), a virtual CRSF **receiver** for INAV SITL and hardware-in-the-loop testing that takes the same UDP RC packets.
+## The model
 
 ```
-┌──────────────┐  UDP :60000   ┌────────────┐  serial (CRSF)  ┌─────────────┐    RF    ┌──────────┐
-│  RC source   │──────RC──────▶│            │────────────────▶│  ELRS/mLRS  │─────────▶│ Receiver │
-│ (joystick,   │               │  crsfproxy │◀────────────────│  TX module  │◀─────────│  + FC    │
-│  GCS, ...)   │               │            │    telemetry    └─────────────┘          └──────────┘
-└──────────────┘               └─────┬──────┘
-                                     │ ▲
-                      UDP :40042 ◀───┘ └───▶ UDP :60001
-                      (raw telemetry          (config API:
-                       → MWP)                  info / get / set / bind)
+          user ↔ server                            server ↔ device
+ ┌──────────────┐   UDP, one port    ┌────────────┐  serial or socket://  ┌─────────────┐  RF  ┌──────────┐
+ │ client(s)    │───────────────────▶│  crsfproxy │──────────────────────▶│ CRSF device │─────▶│ receiver │
+ │ joystick     │◀───────────────────│            │◀──────────────────────│ TX module   │◀─────│ + FC     │
+ │ configurator │  CRSF, STATUS,     │            │  CRSF frames          └─────────────┘      └──────────┘
+ │ GCS, sim     │  CONTROL_REPLY     └────────────┘
+ └──────────────┘
 ```
 
-The network side is intentionally simple. One `crsfproxy` process represents one CRSF endpoint. If a client controls several transmitters, the client is responsible for knowing their UDP endpoints.
+Three links:
 
-## 📦 Install
+- **user↔server** — UDP over IP. It may cross the internet; run it inside a VPN.
+- **server↔device** — local serial, or a transparent TCP byte pipe
+  (`--device socket://host:port`). The bridge parses nothing; crsfproxy owns the
+  CRSF conversation with the module.
+- **ground↔air** — the radio link.
 
-Self-contained — the CRSF codec and the ELRS/mLRS parameter clients live in this repo, no sibling checkout required.
+A serial cable is part of a link, not a link of its own. The two directions are
+independent: RC goes up, telemetry comes down, and neither waits for the other.
 
-```bash
-pip install pyserial          # the proxy
-pip install pygame            # only for joystick_crsf.py
-```
+## One protocol
 
-## 🚀 Quick start
+Every user↔server datagram is one envelope: a 10-byte header and a payload.
 
-Defaults:
-
-```text
-device      /dev/ttyUSB0
-baud        115200
-RC UDP      0.0.0.0:60000
-config UDP  RC port + 1 (60001 by default)
-RC hold     disabled
-radio       elrs
-```
-
-Flags change those defaults; they are not required to enable the normal features.
-
-```bash
-# Start the proxy
-python3 crsfproxy.py
-
-# Send joystick RC to it
-python3 joystick_crsf.py --target 127.0.0.1
-
-# Open the transmitter configuration UI
-python3 config_client.py tui
-```
-
-A full example: ELRS at 921600 baud (exposes the high packet rates, see [Notes](#-notes--gotchas)), telemetry streamed raw to MWP on `:40042`, joystick at 75 Hz:
-
-```bash
-python3 crsfproxy.py --device /dev/ttyUSB0 --baud 921600 \
-    --host 0.0.0.0 --port 60000 \
-    --loop_hz 250 --tx_rate 100 \
-    --telemetry_udp 127.0.0.1:40042 --config_udp 60001
-
-# MWP: listen for UDP telemetry
-mwp -d udp://:40042 -a
-
-# RC source (joystick example)
-python3 joystick_crsf.py --target 127.0.0.1 --port 60000 --rate 75
-```
-
-## 🎮 RC input
-
-### 📨 Wire format
-
-**RC (client → proxy)** — 40-byte little-endian UDP payload:
-
-```
-┌────────────┬───────────────────────────────────┬─────────────────┐
-│ uint32     │ 16 × uint16                       │ uint32          │
-│ t_ms       │ channels (microseconds)           │ crc32(payload)  │
-└────────────┴───────────────────────────────────┴─────────────────┘
-  4 bytes       32 bytes                            4 bytes
-```
-
-The CRC32 covers the first 36 bytes: timestamp plus 16 channels.
-
-### RC hold
-
-RC hold is **disabled by default**.
-
-With the default `--rc-hold-ms 0`, each fresh UDP RC sample is forwarded once, subject to `--tx_rate` as a maximum output rate. If the UDP RC source stops producing fresh samples, crsfproxy stops emitting CRSF RC channel frames. It does not generate substitute channel values and it does not implement a second aircraft failsafe policy.
-
-If you want to smooth very short UDP/input gaps, opt into a small hold window explicitly:
-
-```bash
-python3 crsfproxy.py --rc-hold-ms 80
-```
-
-During that window, crsfproxy may repeat the latest valid RC sample. Once the hold expires, it stops emitting RC frames until fresh UDP RC arrives again.
-
-Actual RF/receiver/flight-controller failsafe behavior remains entirely downstream of crsfproxy.
-
-### 🕹️ joystick_crsf.py
-
-`joystick_crsf.py` reads a pygame joystick and sends the RC packet to one or more proxies (`--rate`, default 50 Hz). The channel mapping for the TX12/RadioMaster and the generic gamepad is documented at the top of `get_joystick_state()` in the script.
-
-## 🔀 Multiple transmitters
-
-Run one proxy per transmitter. Different processes on the same host use different UDP ports:
-
-```bash
-python3 crsfproxy.py \
-    --device /dev/ttyACM0 \
-    --port 60000
-```
-
-```bash
-python3 crsfproxy.py \
-    --device /dev/ttyUSB0 \
-    --port 60010
-```
-
-Because the configuration port defaults to RC port + 1, these automatically use config ports `60001` and `60011`.
-
-`joystick_crsf.py` can send the same controller state to several proxies:
-
-```bash
-python3 joystick_crsf.py \
-    --target 127.0.0.1:60000 \
-    --target 127.0.0.1:60010
-```
-
-The equivalent grouped form is also accepted:
-
-```bash
-python3 joystick_crsf.py \
-    --target 127.0.0.1 --port 60000 \
-    --target 127.0.0.1 --port 60010
-```
-
-There is no extra logical system ID in the UDP protocol. The UDP destination identifies the proxy.
-
-## 📊 Telemetry
-
-`--telemetry_udp host:port` forwards each valid inbound CRSF frame unchanged, one frame per datagram.
-
-```bash
-python3 crsfproxy.py --telemetry_udp 127.0.0.1:40042
-mwp -d udp://:40042 -a
-```
-
-If a program collects telemetry from several proxies, that program is responsible for assigning separate endpoints or otherwise knowing which proxy each stream belongs to.
-
-## 🛠️ Remote TX configuration
-
-The configuration service is on by default at RC port + 1 (`60001`). `DEVICE_INFO` and `PARAMETER_*` frames are inserted into the same scheduled CRSF writes as RC, **while RC traffic keeps flowing**, exactly where a handset would place them, at the pacing the module dictates via `RADIO_ID` sync.
-
-> [!NOTE]
-> This interface only works when the serial device is connected to a transmitter's handset (JR-bay) CRSF port.
-
-### 🚫 No `elrs.lua` required
-
-This is the part people expect to be wrong, so here is precisely what happens.
-
-**`elrs.lua` is not the configuration interface. It is a *client* of it.** On an EdgeTX/OpenTX handset, the settings you see are not defined in the Lua script — they live in the **TX module's firmware**. `elrs.lua` is a generic CRSF parameter browser: it pings the module, reads back whatever parameter table the firmware streams (`DEVICE_INFO` → chunked `PARAMETER_SETTINGS_ENTRY` reads), and renders it. The radio runs the Lua only because *the radio* is what has the screen and the input keys.
-
-crsfproxy is a **second, independent client of that same firmware protocol.** It issues the same `DEVICE_PING` / `PARAMETER_READ` / `PARAMETER_WRITE` / command frames and reads back the same entries. The module is the single source of truth in both cases.
-
-So there is nothing to emulate and nothing to bundle:
-
-- We do **not** parse, ship, or reimplement `elrs.lua`. It never runs here.
-- We do **not** hard-code parameter names, choice lists, folders, unit strings, or rate tables. Every one of those is decoded live from the bytes the module sends (`read_all()` loops `1..parameter_count`, where `parameter_count` comes from the module's own `DEVICE_INFO`).
-- We are **not** EdgeTX. We don't run a Lua VM to produce an interface — we *are* a consumer of the interface the module already exposes on the wire.
-
-The only things crsfproxy actually implements are the two layers that are defined by the CRSF spec and are version-stable: the frame codec, and the parameter read/write/command/chunking state machine. That is the same protocol `elrs.lua` implements in Lua — because both talk to the same firmware.
-
-| Layer | Where it lives | Changes per ELRS version? | In this repo? |
+| Offset | Size | Field | Meaning |
 |---|---|---|---|
-| Parameter **content** — names, choices, folders, rate tables | TX module firmware | Yes | **No** — read live off the wire |
-| Parameter **protocol** — ping/read/write/command/chunk | CRSF spec | No (spec-stable) | Yes (`lib/elrs_config.py`) |
-| Frame **codec** — CRSF framing & types | CRSF spec | No (spec-stable) | Yes (`lib/crsf_protocol.py`) |
+| 0 | 1 | `version` | `1` |
+| 1 | 1 | `kind` | payload type |
+| 2 | 4 | `session` | sender's session, nonzero |
+| 6 | 4 | `seq` | sender's counter for this kind |
+| 10 | n | payload | depends on `kind` |
 
-### One-shot commands
+| `kind` | Name | Direction | Payload |
+|---|---|---|---|
+| 1 | CRSF | both | exactly one CRSF frame |
+| 2 | CONTROL | client → server | JSON request object |
+| 3 | CONTROL_REPLY | server → requester | JSON reply object |
+| 4 | STATUS | server → destinations | link health |
 
-The default endpoint is `127.0.0.1:60001`.
+`seq` counts per sender and per kind; it starts at 0 for each session, increments
+by one, and wraps at 2³². A CONTROL_REPLY carries the `session` and `seq` of the
+request it answers.
 
-```bash
-python3 config_client.py info
-python3 config_client.py devices
-python3 config_client.py params
-python3 config_client.py get "Packet Rate"
-python3 config_client.py set "RF Band" "2.4GHz"
-python3 config_client.py set "Packet Rate" "333Hz Full(-105dBm)"
-python3 config_client.py command Bind --confirm
-```
+The shape follows from four rules:
 
-For another proxy, or a proxy on another host:
+- **CRSF is the payload.** RC is `RC_CHANNELS_PACKED`; telemetry is the module's
+  own frames; parameter traffic is CRSF too. One codec, not one format per
+  client.
+- **The envelope adds only what UDP needs.** A version, a kind, a session, and a
+  sequence number. No second channel encoding and no timestamp field.
+- **Session and seq do the reliability work.** They identify the RC owner,
+  reject stale frames, retry CONTROL requests without re-executing them, and
+  expose downlink loss without a separate protocol.
+- **CONTROL is for the server itself.** Device discovery, parameters, writes,
+  and commands are JSON request/reply. It is not a second configuration
+  protocol on a second port.
 
-```bash
-python3 config_client.py --port 60011 info
-python3 config_client.py --host proxy-host --port 60001 info
-```
+The full contract is [`PROTOCOL.md`](PROTOCOL.md).
 
-Writes are read back for verification. `command` runs like `elrs.lua`: when the device asks for confirmation, its own prompt is shown on the terminal (`--confirm` answers yes), progress is printed while it runs, and Ctrl-C cancels it.
-
-### Interactive TUI
-
-```bash
-python3 config_client.py --host proxy-host --port 60001 tui
-```
-
-A curses browser over the live parameter hierarchy read from the module, in your terminal's default colors:
-
-| Key | Action |
-|---|---|
-| <kbd>↑</kbd> / <kbd>↓</kbd> | Select |
-| <kbd>→</kbd> / <kbd>Enter</kbd> | Open folder · edit value · run command |
-| <kbd>←</kbd> / <kbd>Esc</kbd> | Back to parent (exits at root) |
-| <kbd>r</kbd> | Reload the table |
-| <kbd>Esc</kbd> (command popup) | Cancel the running command |
-
-Selection parameters get a choice list; numeric parameters get a text prompt and are **verified by reading them back**. Empty selection placeholders sent by ELRS are hidden without disturbing their underlying selection indices. A persistent banner shows the latest ELRS status message, connection state, flags, and good/bad packet counts.
-
-Commands (Bind, WiFi update, …) open a popup like `elrs.lua`'s: the device's own confirmation prompt (<kbd>y</kbd> confirms, any other key cancels), then its progress text with a spinner, polled at the interval the device asks for, for as long as it runs. <kbd>Esc</kbd> or <kbd>←</kbd> cancels a running command, as RTN does in `elrs.lua`. A failed action is shown on the TUI status line.
-
-<details>
-<summary><b>What <code>info</code> returns</b></summary>
-
-- `DEVICE_INFO` model and version
-- All current parameter values reported by the module (band, packet rate, link mode, model ID, firmware-provided info fields, …)
-- The `RADIO_ID` handset rate
-- Latest ELRS status: connection/binding state, flags, packet counts, message
-- Firmware hash, when the transmitter exposes it as an INFO or STRING parameter
-
-</details>
-
-### 🔌 UDP API
-
-The configuration interface is ordinary UDP request/reply: UTF-8 datagrams on the config port. Replies return to the source address and port of each request.
-
-Accepts JSON:
-
-```json
-{"command":"set","parameter":"Packet Rate","value":"333Hz Full(-105dBm)"}
-```
-
-…or shell-style UTF-8 commands:
-
-```text
-info
-devices
-params
-get "Packet Rate"
-set "Packet Rate" "333Hz Full(-105dBm)"
-command "Bind" start
-```
-
-Every response is JSON:
-
-```json
-{"ok":true,"result":{"verified":true}}
-```
-
-**Commands** are run one step per request, the way `elrs.lua` drives them (`COMMAND_STEPS` in `lib/crsf_protocol.py`): `{"command":"command","parameter":"Bind","step":"start"}`, with `step` one of `start`, `confirm`, `cancel`, `poll`. Each step is sent to the device once and answered with the parameter's new state (`command_status`, `command_timeout` in 10 ms units, `command_info`). After `start`:
-
-| `command_status` | Meaning | Next request |
-|---|---|---|
-| `0` READY | finished (or never started) | none |
-| `3` CONFIRMATION_NEEDED | `command_info` is the device's prompt | `confirm` or `cancel` |
-| anything else (`2` PROGRESS) | running, `command_info` is its progress text | `poll` after `command_timeout` × 10 ms, or `cancel` |
-
-The proxy never waits for a command to finish, so other configuration requests are served while one runs. mLRS commands (Save, Bind, …) answer the same steps: `start` asks for confirmation with the command's description, `confirm` sends it, `cancel` drops it.
-
-> [!IMPORTANT]
-> Only one configuration operation is processed at a time. Reads and writes can take several seconds — ELRS parameter entries are chunked and every write is read back for verification. There are **no automatic UDP retries**, because repeating a command like `Bind` can have side effects.
-
-## 📻 Radio selection
-
-`--radio` selects a radio backend (`lib/radio.py`): its configuration transport and service, its default baud, which first bytes start an inbound serial frame, and whether the ELRS status poll is sent. The RC bridge, telemetry forwarding, serial scheduling and frame parsing, and the UDP configuration API are shared.
-
-### ExpressLRS
-
-ExpressLRS is the default:
+## Quick start
 
 ```bash
-python3 crsfproxy.py
+pip install pyserial
+
+python3 crsfproxy.py --device /dev/ttyUSB0
+python3 joystick_crsf.py --target 127.0.0.1:60000
+python3 config_client.py --port 60000 info
 ```
 
-Use a different handset-side baud when required by the module or packet rate:
+`crsfproxy` listens on `60000/udp`. The joystick sends CRSF RC frames.
+`config_client.py` sends CONTROL requests to the same port.
+
+A remote device through a transparent bridge:
 
 ```bash
-python3 crsfproxy.py --baud 921600
+python3 crsfproxy.py --device socket://192.168.1.50:60000
 ```
 
-The ELRS configuration backend uses the standard CRSF device/parameter protocol used by `elrs.lua` (see [No `elrs.lua` required](#-no-elrslua-required)).
+Over `socket://`, `--baud` is ignored: set the UART baud on the bridge. The
+bridge accepts one TCP client.
 
-### mLRS
+Telemetry to MWP (bare CRSF frames):
 
 ```bash
-python3 crsfproxy.py --radio mlrs
+python3 crsfproxy.py --telemetry_raw 127.0.0.1:40042
+mwp -d udp://:40042 -a
 ```
 
-mLRS uses **400000 baud** on the radio-side CRSF interface. When `--radio mlrs` is selected and `--baud` is omitted, the mLRS backend supplies that value.
-
-mLRS configuration uses the official mBridge command protocol carried in CRSF frame types `0x81` and `0x82`; the backend also accepts mLRS replies addressed to CRSF radio address `0xEA`. The same `config_client.py` commands work against the mLRS backend, including Save and Bind commands.
-
-Example:
-
-```bash
-python3 config_client.py get "Tx Ch Source"
-python3 config_client.py set "Tx Ch Source" crsf
-python3 config_client.py command Save --confirm
-```
-
-mLRS parameter writes are live changes and are not persistent until Save, matching the official mLRS Lua configurator.
-
-## 🧪 INAV SITL
-
-### crsfproxy against a SITL UART
-
-INAV SITL exposes virtual UARTs as TCP ports:
-
-```text
-UART1 -> TCP 5760
-UART2 -> TCP 5761
-UART3 -> TCP 5762
-...
-```
-
-Configure the selected SITL UART as a normal CRSF serial receiver, then point `crsfproxy` directly at it using pySerial's `socket://` transport.
-
-Example for UART3:
+INAV SITL:
 
 ```bash
 python3 crsfproxy.py --device socket://127.0.0.1:5762
 ```
 
-Then send RC normally:
+Configure the SITL UART as a CRSF serial receiver. No PTY or `socat` bridge is
+needed.
 
-```bash
-python3 joystick_crsf.py --target 127.0.0.1
-```
+One proxy owns one device. Run another process with another `--port` for a
+second device; clients target that port. There is no logical system ID in the
+protocol.
 
-No PTY or `socat` bridge is required.
+## RC
 
-### 🛰️ Virtual CRSF receiver for INAV SITL
+- The first accepted RC sender after start, or after a release, becomes the
+  **owner**.
+- An owner frame with a newer `seq` is accepted. A stale owner frame, or a frame
+  from any other sender, is dropped and counted.
+- Ownership is released after `--rc_owner_timeout_ms` (default 1000) with no
+  accepted RC.
+- The server writes at most one RC frame per `--tx_rate` slot. `--rc-hold-ms`
+  optionally repeats the latest sample for a short gap; after that it stops.
+- The server never generates center or failsafe values. Failsafe is downstream.
+- `--tx_rate` is a maximum. Keep `--loop_hz` above it; a late slot is skipped,
+  not sent in a burst.
+- The joystick client maps stick positions to 1000–2000 µs; the shared CRSF
+  codec packs them into the 11-bit channel field.
 
-`crsf_rx_sim.py` impersonates an ELRS/CRSF **receiver** at the UART boundary INAV sees. It takes the same 40-byte UDP RC packet, sends `RC_CHANNELS_PACKED` and `LINK_STATISTICS` to INAV over TCP, reads telemetry back, and can simulate RC-source timeout, RF loss and TCP serial loss separately. Run one process per receiver for dual-receiver testing.
+## Telemetry and status
 
-```bash
-python3 crsf_rx_sim.py --endpoint tcp://127.0.0.1:5763
-```
+- Every valid frame from the device goes to each `--telemetry` destination as a
+  CRSF envelope and to each `--telemetry_raw` destination as a bare CRSF frame.
+- `--telemetry` destinations also receive STATUS at `--status_hz` (default 5):
+  RC age, owner session and seq, accepted/stale/foreign counts, and device RX
+  age.
+- The server sends nothing to a peer just because the peer sent something. To
+  receive downlink, add your endpoint to `--telemetry` or `--telemetry_raw`. The
+  one exception is a CONTROL_REPLY to its requester.
+- Gaps in the server's per-kind `seq` are downlink loss. A new server session
+  means the server restarted.
+- RTT: `now - send_time(STATUS.rc_seq) - STATUS.rc_age_ms`.
 
-Full documentation: [`SITL_RECEIVER.md`](SITL_RECEIVER.md). Two-receiver launch script: [`examples/dual_receiver_commands.sh`](examples/dual_receiver_commands.sh).
+## Configuration
 
-## ⚙️ Options
+CONTROL requests are JSON objects on the same port:
 
-| Flag | Default | Description |
+| Request | Result |
+|---|---|
+| `{"command":"devices"}` | devices found by a ping |
+| `{"command":"info"}` | summary: device, key settings, status |
+| `{"command":"params","offset":O}` | a page of the parameter table |
+| `{"command":"get","parameter":P}` | one parameter |
+| `{"command":"set","parameter":P,"value":V}` | write, then read back |
+| `{"command":"command","parameter":P,"step":S}` | one command step |
+
+`P` is a parameter name or decimal id.
+
+`V` is a string:
+- option text or index for a selection;
+- a number otherwise.
+
+`S` is `start`, `confirm`, `cancel`, or `poll`.
+
+`params` is paginated:
+- `offset` defaults to 0;
+- the reply has `total` and `more`;
+- loop until `more` is false.
+
+A reply is `{"ok":true,"result":{...}}` or
+`{"ok":false,"error":{"code":C,"message":"..."}}` with `code` one of `busy`,
+`bad_request`, `failed`, `stale`.
+
+One request runs at a time, server-wide:
+- The request key is (peer, session, `seq`).
+- A retry with the same key returns the cached reply and does not execute again.
+- `busy`: another request is running; retry the same request later.
+
+Commands run as steps:
+- send `start`;
+- `command_status` 3: send `confirm` or `cancel`;
+- running: `poll` after `command_timeout` × 10 ms;
+- `0`: finished.
+`command_info` is the device's prompt or progress text.
+
+ELRS parameter content lives in the module's firmware:
+- names;
+- choices;
+- folders;
+- rates.
+
+crsfproxy does not ship or parse `elrs.lua`; it does not hard-code the table.
+`params` and `get` read it live.
+`info` is a convenience summary of a few well-known ELRS names. A renamed
+parameter can appear as null there while remaining present in `params`.
+New firmware settings therefore appear without a crsfproxy release.
+
+Keep RC flowing while configuring an ELRS module; its handset link is more
+reliable with traffic.
+
+Raw non-RC CRSF frames are forwarded only from the RC owner, and they are paused
+while a CONTROL request runs. They are a legacy path for a radio's own
+configurator; its endpoint must be a `--telemetry` destination to see the
+device's answers.
+
+mLRS uses `--radio mlrs` and 400000 baud on the handset side. It speaks mBridge
+in CRSF frames `0x81` and `0x82`; writes are live until the `Save` command.
+
+The protocol has no authentication or encryption. Run it inside a VPN and bind
+the server to the VPN interface (`--host`).
+
+## Radio backends
+
+`--radio elrs` is the default; `--radio mlrs` selects the mLRS backend. The
+backend supplies its default baud, the frame addresses it accepts, its
+configuration transport and service, and whether it polls the module's status.
+The server loop, envelope, RC owner, scheduling, and telemetry forwarding are
+shared.
+
+## Clients
+
+| Program | Role |
+|---|---|
+| `joystick_crsf.py` | pygame joystick to CRSF RC; one or more targets |
+| `config_client.py` | CONTROL client: CLI and curses TUI |
+| `crsf_rx_sim.py` | virtual CRSF receiver server for INAV SITL |
+
+`config_client.py` provides `info`, `devices`, `params`, `get`, `set`,
+`command`, and `tui`. `set` reads the value back. A command shows the device's
+own confirmation prompt and progress, and can be cancelled. In the TUI, arrows
+navigate, Enter edits or runs, Esc backs out or cancels a running command.
+
+`crsf_rx_sim.py` impersonates a CRSF receiver at the UART boundary INAV sees.
+It speaks the same envelope to its clients, takes CRSF RC in, and exposes its
+simulation controls as CONTROL. See [`SITL_RECEIVER.md`](SITL_RECEIVER.md).
+
+The contract is not crsfproxy-specific. The ESP32-P4 node, the C6 bay module,
+and NetGCS are expected to implement the same user↔server link.
+
+## Options
+
+| Flag | Default | Meaning |
 |---|---|---|
-| `--radio` | `elrs` | Radio backend: `elrs` or `mlrs` |
-| `--device` | `/dev/ttyUSB0` | Serial device or pySerial URL. `socket://host:port` is a transparent TCP bridge (e.g. the ESP32-P4 CRSF bridge); `--baud` is ignored over `socket://` |
-| `--baud` | `115200` | CRSF serial baudrate; mLRS defaults to `400000` |
-| `--host` | `0.0.0.0` | UDP bind host for RC packets |
-| `--port` | `60000` | UDP port for RC packets |
-| `--tx_rate` | `100` | Maximum RC frame rate (Hz) |
-| `--loop_hz` | `250` | Max main loop rate (Hz) — caps main-loop CPU, keep above tx_rate |
-| `--rc-hold-ms` | `0` | Repeat the latest RC sample for up to this many ms after input stops; `0` disables hold |
-| `--telemetry_udp` | — | Send raw CRSF telemetry to `host:port` (e.g. MWP) |
-| `--config_udp` | RC port + 1 | UDP port for TX configuration commands |
-| `--debug` | off | Verbose serial/RC/telemetry logging |
+| `--radio` | `elrs` | radio backend: `elrs` or `mlrs` |
+| `--device` | `/dev/ttyUSB0` | serial device or `socket://host:port` |
+| `--baud` | 115200 ELRS / 400000 mLRS | CRSF serial baud; ignored over `socket://` |
+| `--host` | `0.0.0.0` | UDP bind address; use the VPN interface |
+| `--port` | `60000` | the one protocol port |
+| `--tx_rate` | `100` | maximum RC frame rate (Hz) |
+| `--loop_hz` | `250` | main-loop cap; keep above `--tx_rate` |
+| `--rc-hold-ms` | `0` | repeat the latest RC sample for up to this long; 0 disables |
+| `--telemetry` | none | envelope downlink destination; repeatable |
+| `--telemetry_raw` | none | bare CRSF downlink destination; repeatable |
+| `--rc_owner_timeout_ms` | `1000` | RC owner release time |
+| `--status_hz` | `5` | STATUS rate |
+| `--debug` | off | verbose frame and timing logging |
 
-## 📝 Notes & gotchas
+## Notes
 
-- **Baud startup:** The serial port opens directly at `--baud` and immediately streams RC frames. ExpressLRS detects the handset baud from that continuous CRSF traffic.
-- **Transparent TCP bridge:** `--device socket://host:port` drives a remote serial bridge such as the ESP32-P4 CRSF bridge. The bridge owns the UART baud (`--baud` is ignored over the socket); RC input, telemetry and `config_client.py` work over the same connection.
-- 📉 ELRS hides packet rates that can't fit over the configured handset baud. At 115200 the TX reports `Baud rate too low` and blanks rates such as 333 Hz and 500 Hz — use 921600 to expose the full high-rate table.
-- mLRS only supports 400K baud on its handset-side CRSF interface.
-- 🐛 Some CP2102 USB serial adapters behave badly around 400–460K baud.
-- ⏱️ **RC timing:** RC slots run on a fixed deadline grid (slot *n* due at start + *n* / `--tx_rate`, `lib/schedule.py`), so the slot rate equals `--tx_rate` as long as `--loop_hz` is higher; each frame goes out up to one loop period after its deadline, and a late slot is skipped rather than sent in a burst. With the default `--loop_hz 250`, `--tx_rate` above 250 is capped by the loop (measured: 300 → about 244 Hz); raise `--loop_hz` with it.
+- **Baud startup:** the module learns the handset baud from CRSF traffic. Open
+  at the baud the module should use; after changing it, power-cycle the module.
+- **`socket://`:** a byte stream, not packets. The bridge owns the UART baud and
+  accepts one TCP client; a new connection replaces the old one.
+- **ELRS high rates:** ELRS hides packet rates that do not fit the handset baud.
+  921600 exposes them, but after a bridge boot the handset link needs continuous
+  RC for about 10 s to settle. 400000 is the forgiving choice for configuration.
+- **mLRS:** 400000 baud on the handset side.
+- **CP2102:** some adapters behave badly around 400–460k baud.
+- **Timing:** `--tx_rate` is a fixed slot grid. With the default `--loop_hz 250`,
+  a `--tx_rate` above 250 is capped by the loop (300 measures about 244 Hz).
+- **Security:** no authentication. Bind to the VPN interface and firewall the
+  port.
 
-> [!WARNING]
-> The configuration port has **no authentication**. Bind it to a trusted interface or restrict it with a firewall.
+## Version and compatibility
 
-## 📌 Version compatibility
+crsfproxy v0.4 implements protocol v1. Verified against ExpressLRS 4.0.1.
+mLRS support is implemented; verify it against your firmware version.
 
-**This is crsfproxy v0.3. Developed and verified against ExpressLRS 4.0.1.**
+The frame codec and the parameter read/write/command protocol are spec-stable;
+the parameter content is read from the module, so new settings do not need a
+code change. A firmware that changes the protocol itself would. "Tested" means
+what has been exercised, not a hard gate.
 
-The configuration feature depends only on protocol layers that are defined by the [CRSF specification](https://github.com/tbs-fpv/tbs-crsf-spec/blob/main/crsf.md) and are stable across ELRS releases — the frame codec and the device-parameter read/write/command/chunking exchange. It does **not** depend on any per-version parameter list, because that list is read live from the module (see [No `elrs.lua` required](#-no-elrslua-required)). New, renamed, or reordered *settings* on a different firmware version therefore need no changes here — they simply appear.
+### Changes from v0.3
 
-What *would* require a code change is a change to the protocol itself: a new `PARAMETER_TYPE`, an altered `DEVICE_INFO`/`PARAMETER_SETTINGS_ENTRY` layout, or new command-status semantics. Those are rare and spec-governed, but they are the reason this is pinned to a tested version rather than claimed as universally compatible. If you run a different ELRS version and everything reads and writes back correctly, it works on your version too; the 4.0.1 pin is a statement of what has actually been exercised, not a hard gate.
+| v0.3 | v1 |
+|---|---|
+| 40-byte RC packet (`t_ms`, 16 × µs, CRC32) | CRSF `RC_CHANNELS_PACKED` in an envelope |
+| JSON or shell-style text on `--config_udp` (RC port + 1) | CONTROL JSON on the same port |
+| full parameter table in one `params` reply | paginated `params`; `info` is a summary |
+| raw telemetry to one `--telemetry_udp` address | `--telemetry` (envelope) and `--telemetry_raw` (bare), repeatable |
+| "one RC source" as a usage rule | RC owner, enforced |
+| — | STATUS |
 
-## 🗂️ Repository layout
+v0.3 is the previous release and keeps the old wire format. v0.4 includes the
+`socket://` block-read fix; use v0.4 for new work.
 
-The root Python files are the programs a user runs. Supporting code lives under `lib/`.
-
-```text
-crsfproxy.py          run one CRSF proxy (--radio selects the backend)
-joystick_crsf.py      send joystick RC to one or more proxies
-config_client.py      inspect and configure one transmitter (CLI + TUI)
-crsf_rx_sim.py        virtual CRSF receiver for INAV SITL
-
-lib/
-    __init__.py
-    radio.py          radio backend contract (what --radio selects)
-    elrs_backend.py   proxy core + ExpressLRS radio backend (ELRS_RADIO)
-    mlrs_backend.py   mLRS mBridge radio backend (MLRS_RADIO)
-    elrs_config.py    ELRS device-parameter protocol client
-    crsf_protocol.py  CRSF frame codec
-    rc_packet.py      the 40-byte UDP RC packet
-    schedule.py       fixed-rate deadline schedule (proxy + simulator)
-
-examples/
-    dual_receiver_commands.sh
-
-tests/
-    ...
-```
-
-If a Python file is in the repository root, it is something a user runs.
-
-Run the tests from the repository root:
+## Development
 
 ```bash
 python3 -m unittest discover -s tests -v
 ```
 
-## 📄 License
+```text
+crsfproxy.py          server entry point
+joystick_crsf.py      CRSF RC client
+config_client.py      CONTROL client (CLI + TUI)
+crsf_rx_sim.py        virtual receiver server for INAV SITL
+
+lib/envelope.py       protocol v1 envelope and STATUS
+lib/server.py         server loop, RC owner, CONTROL cache, downlink
+lib/config.py         shared parameter/device objects and pagination
+lib/transport.py      serial loop <-> configuration service transport
+lib/radio.py          radio backend contract
+lib/elrs_backend.py   ExpressLRS backend
+lib/mlrs_backend.py   mLRS backend
+lib/elrs_config.py    CRSF parameter protocol client
+lib/crsf_protocol.py  CRSF codec
+lib/schedule.py       deadline schedule
+
+tests/                unit tests
+examples/             launch scripts
+```
+
+The root Python files are the programs a user runs. Supporting code is in
+`lib/`.
+
+## License
 
 [GPL-3.0](LICENSE), the same as ExpressLRS.
 
-
-## Attribution
+## Credits
 
 - Yours truly
 - Claude Fable 5, Opus 5.5

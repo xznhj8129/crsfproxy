@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
 """Virtual CRSF receiver for INAV SITL and hardware-in-the-loop testing.
 
-The simulator accepts the same 40-byte UDP RC packet used by crsfproxy,
-generates CRSF RC_CHANNELS_PACKED and LINK_STATISTICS frames, and exchanges
-raw CRSF frames with INAV over a TCP socket.
+The simulator speaks crsfproxy protocol v1 on one UDP port: Kind.CRSF
+envelopes carrying RC_CHANNELS_PACKED drive RC, and Kind.CONTROL envelopes
+carry JSON simulation commands. It generates CRSF RC_CHANNELS_PACKED and
+LINK_STATISTICS frames and exchanges raw CRSF frames with INAV over a TCP
+socket.
 
 Examples:
   python crsf_rx_sim.py --endpoint tcp://127.0.0.1:5763
-  python crsf_rx_sim.py --endpoint tcp-listen://127.0.0.1:5763
+  python crsf_rx_sim.py --endpoint tcp-listen://127.0.0.1:5763 --port 60000
 
 Run multiple independent receivers by starting multiple instances with distinct
-endpoint, RC UDP, and control UDP ports.
+endpoint and UDP protocol ports.
 """
 
 from __future__ import annotations
@@ -18,7 +20,6 @@ from __future__ import annotations
 import argparse
 import json
 import select
-import shlex
 import socket
 import struct
 import sys
@@ -28,6 +29,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+from lib import envelope
 from lib.crsf_protocol import (
     CRSF_ADDRESS_FLIGHT_CONTROLLER,
     CRSF_CHANNEL_COUNT,
@@ -36,8 +38,9 @@ from lib.crsf_protocol import (
     describe_frame,
     make_frame,
     make_rc_frame,
+    unpack_channels_us,
+    validate_frame,
 )
-from lib.rc_packet import RcPacket
 from lib.schedule import DeadlineSchedule
 
 DEFAULT_RC_RATE_HZ = 150.0
@@ -102,15 +105,20 @@ def parse_channels(values: list[str] | tuple[str, ...]) -> list[int]:
     return channels
 
 
-def decode_udp_rc_packet(data: bytes) -> tuple[int, list[int]]:
-    packet = RcPacket.decode(data)
-    channels = list(packet.channels_us)
+def decode_rc_frame(data: bytes) -> list[int]:
+    if not validate_frame(data):
+        raise ValueError(f"frame_len={len(data)} invalid CRSF frame")
+    if data[2] != FrameType.RC_CHANNELS_PACKED:
+        raise ValueError(
+            f"frame_type=0x{data[2]:02X} expected=0x{FrameType.RC_CHANNELS_PACKED:02X}"
+        )
+    channels = unpack_channels_us(data[3:-1])
     for index, value in enumerate(channels):
         if not 750 <= value <= 2250:
             raise ValueError(
                 f"channel_index={index} channel_value_us={value} valid_range=750..2250"
             )
-    return packet.timestamp_ms, channels
+    return channels
 
 
 def encode_signed_byte(value: int) -> int:
@@ -298,22 +306,13 @@ class CaptureWriter:
 
 
 def parse_control_request(data: bytes) -> dict[str, Any]:
-    text = data.decode("utf-8").strip()
-    if not text:
-        raise ValueError("empty control request")
-    if text.startswith("{"):
-        request = json.loads(text)
-        if not isinstance(request, dict):
-            raise ValueError("JSON control request must be an object")
-        return request
-
-    words = shlex.split(text)
-    action = words[0].replace("-", "_").casefold()
-    if action in ("status", "drop_rf", "restore_rf") and len(words) == 1:
-        return {"action": action}
-    if action == "set" and len(words) == 3:
-        return {"action": "set_link", words[1]: int(words[2])}
-    raise ValueError(f"unsupported control request={text!r}")
+    text = data.decode("utf-8")
+    request = json.loads(text)
+    if not isinstance(request, dict):
+        raise ValueError("CONTROL request must be a JSON object")
+    if not isinstance(request.get("command"), str):
+        raise ValueError("CONTROL request has no string command")
+    return request
 
 
 def apply_control_request(
@@ -322,25 +321,25 @@ def apply_control_request(
     now: float,
     connected: bool,
 ) -> dict[str, Any]:
-    action = str(request.get("action", "")).replace("-", "_").casefold()
-    if action == "status":
+    command = str(request.get("command", "")).replace("-", "_").casefold()
+    if command == "status":
         return state.snapshot(connected)
-    if action == "drop_rf":
+    if command == "drop_rf":
         state.rf_link = False
         return state.snapshot(connected)
-    if action == "restore_rf":
+    if command == "restore_rf":
         state.rf_link = True
         return state.snapshot(connected)
-    if action == "set_channels":
+    if command == "set_channels":
         values = request.get("channels")
         if not isinstance(values, list):
             raise ValueError("set_channels requires channels array")
         channels = parse_channels(tuple(str(value) for value in values))
         state.accept_rc(int(now * 1000), channels, now)
         return state.snapshot(connected)
-    if action == "set_link":
+    if command == "set_link":
         valid_names = set(LinkStatistics.__dataclass_fields__)
-        updates = {key: value for key, value in request.items() if key != "action"}
+        updates = {key: value for key, value in request.items() if key != "command"}
         if not updates:
             raise ValueError("set_link requires at least one link field")
         unknown = sorted(set(updates) - valid_names)
@@ -350,7 +349,7 @@ def apply_control_request(
             setattr(state.link, name, int(value))
         state.link.validate()
         return state.snapshot(connected)
-    raise ValueError(f"unknown action={action!r}")
+    raise ValueError(f"unknown command={command!r}")
 
 
 def open_udp_listener(host: str, port: int) -> socket.socket:
@@ -361,49 +360,70 @@ def open_udp_listener(host: str, port: int) -> socket.socket:
     return udp_socket
 
 
-def receive_rc_packets(udp_socket: socket.socket, state: ReceiverState, now: float, debug: bool) -> None:
-    while True:
-        try:
-            data, sender = udp_socket.recvfrom(65535)
-        except BlockingIOError:
-            return
-        try:
-            timestamp_ms, channels = decode_udp_rc_packet(data)
-        except ValueError as error:
-            state.rejected_rc_packets += 1
-            if debug:
-                print(f"RC reject sender={sender} error={error}", file=sys.stderr)
-            continue
-        state.accept_rc(timestamp_ms, channels, now)
-        if debug:
-            print(
-                f"RC accept sender={sender} timestamp_ms={timestamp_ms} "
-                f"channels_1_4={channels[:4]}"
-            )
-
-
-def receive_control_packets(
+def receive_packets(
     udp_socket: socket.socket,
     state: ReceiverState,
     now: float,
     connected: bool,
     debug: bool,
 ) -> None:
+    """Consume every queued protocol v1 datagram on the UDP port."""
     while True:
         try:
             data, sender = udp_socket.recvfrom(65535)
         except BlockingIOError:
             return
         try:
-            request = parse_control_request(data)
-            result = apply_control_request(state, request, now, connected)
-            response = {"ok": True, "result": result}
-        except (UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError) as error:
-            response = {"ok": False, "error": f"{type(error).__name__}: {error}"}
-        payload = json.dumps(response, separators=(",", ":")).encode("utf-8")
-        udp_socket.sendto(payload, sender)
+            message = envelope.decode(data)
+        except ValueError as error:
+            if debug:
+                print(f"UDP reject sender={sender} error={error}", file=sys.stderr)
+            continue
+
+        if message.kind == envelope.Kind.CRSF:
+            try:
+                channels = decode_rc_frame(message.payload)
+            except ValueError as error:
+                state.rejected_rc_packets += 1
+                if debug:
+                    print(f"RC reject sender={sender} error={error}", file=sys.stderr)
+                continue
+            timestamp_ms = int(now * 1000)
+            state.accept_rc(timestamp_ms, channels, now)
+            if debug:
+                print(
+                    f"RC accept sender={sender} session={message.session} "
+                    f"seq={message.seq} timestamp_ms={timestamp_ms} "
+                    f"channels_1_4={channels[:4]}"
+                )
+            continue
+
+        if message.kind == envelope.Kind.CONTROL:
+            try:
+                request = parse_control_request(message.payload)
+                result = apply_control_request(state, request, now, connected)
+                response = {"ok": True, "result": result}
+            except (UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError) as error:
+                response = {
+                    "ok": False,
+                    "error": {
+                        "code": "bad_request",
+                        "message": f"{type(error).__name__}: {error}",
+                    },
+                }
+            payload = json.dumps(response, separators=(",", ":")).encode("utf-8")
+            reply = envelope.encode(
+                envelope.Kind.CONTROL_REPLY, message.session, message.seq, payload)
+            udp_socket.sendto(reply, sender)
+            if debug:
+                print(
+                    f"CONTROL sender={sender} session={message.session} "
+                    f"seq={message.seq} response={response}"
+                )
+            continue
+
         if debug:
-            print(f"CONTROL sender={sender} response={response}")
+            print(f"UDP ignore sender={sender} kind={message.kind.name}")
 
 
 def read_connection(
@@ -447,15 +467,13 @@ def build_argument_parser() -> argparse.ArgumentParser:
         help="tcp://host:port to connect or tcp-listen://host:port to accept INAV",
     )
     parser.add_argument("--name", default="rx0", help="Receiver name used in logs")
-    parser.add_argument("--host", default="0.0.0.0", help="UDP RC bind host")
-    parser.add_argument("--port", type=int, default=60000, help="UDP RC bind port")
-    parser.add_argument("--control_host", default="127.0.0.1", help="Control UDP bind host")
-    parser.add_argument("--control_port", type=int, default=60001, help="Control UDP bind port; 0 disables")
+    parser.add_argument("--host", default="0.0.0.0", help="UDP protocol v1 bind host")
+    parser.add_argument("--port", type=int, default=60000, help="UDP protocol v1 bind port")
     parser.add_argument("--rc_rate", type=float, default=DEFAULT_RC_RATE_HZ, help="RC frame rate Hz")
     parser.add_argument("--link_rate", type=float, default=DEFAULT_LINK_RATE_HZ, help="Link statistics rate Hz; 0 disables")
     parser.add_argument("--loop_rate", type=float, default=DEFAULT_LOOP_RATE_HZ, help="Main loop rate Hz")
     parser.add_argument("--reconnect_delay", type=float, default=DEFAULT_RECONNECT_DELAY_S, help="Seconds between TCP retries")
-    parser.add_argument("--source_timeout_ms", type=int, default=1000, help="UDP RC silence timeout; 0 disables")
+    parser.add_argument("--source_timeout_ms", type=int, default=1000, help="UDP RC envelope silence timeout; 0 disables")
     parser.add_argument(
         "--source_timeout_action",
         choices=("hold", "failsafe", "stop"),
@@ -509,12 +527,7 @@ def run(args: argparse.Namespace) -> None:
     )
     state.validate()
 
-    rc_socket = open_udp_listener(args.host, args.port)
-    control_socket = (
-        open_udp_listener(args.control_host, args.control_port)
-        if args.control_port
-        else None
-    )
+    udp_socket = open_udp_listener(args.host, args.port)
     telemetry_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     capture = CaptureWriter(args.capture)
     endpoint = TcpEndpoint(endpoint_spec)
@@ -529,23 +542,20 @@ def run(args: argparse.Namespace) -> None:
 
     print(
         f"Virtual receiver name={args.name!r} endpoint={args.endpoint!r} "
-        f"rc_udp={args.host}:{args.port} control_udp="
-        f"{args.control_host}:{args.control_port if args.control_port else 'disabled'} "
+        f"udp={args.host}:{args.port} "
         f"rc_rate_hz={args.rc_rate} link_rate_hz={args.link_rate}"
     )
 
     try:
         while True:
             loop_started_at = time.monotonic()
-            receive_rc_packets(rc_socket, state, loop_started_at, args.debug)
-            if control_socket is not None:
-                receive_control_packets(
-                    control_socket,
-                    state,
-                    loop_started_at,
-                    connection is not None,
-                    args.debug,
-                )
+            receive_packets(
+                udp_socket,
+                state,
+                loop_started_at,
+                connection is not None,
+                args.debug,
+            )
 
             if connection is None and loop_started_at - last_connect_attempt >= args.reconnect_delay:
                 last_connect_attempt = loop_started_at
@@ -616,9 +626,7 @@ def run(args: argparse.Namespace) -> None:
     finally:
         if connection is not None:
             connection.close()
-        rc_socket.close()
-        if control_socket is not None:
-            control_socket.close()
+        udp_socket.close()
         telemetry_socket.close()
         capture.close()
 

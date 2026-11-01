@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Send joystick RC state to one or more crsfproxy UDP targets.
+"""Send joystick RC state to one or more crsfproxy protocol v1 targets.
 
 Examples:
   python3 joystick_crsf.py --target 127.0.0.1
@@ -10,8 +10,9 @@ Examples:
 Each --target starts one destination. A following --port applies to that target.
 Targets without an explicit port use 60000.
 
-UDP packet format:
-<uint32 t_ms><16 x uint16 us><uint32 crc32>, defined in lib/rc_packet.py
+Every datagram is a protocol v1 Kind.CRSF envelope carrying one
+RC_CHANNELS_PACKED frame. One session and one CRSF seq sequence are shared by
+all targets, and the same envelope is sent to each target.
 """
 
 import argparse
@@ -21,8 +22,8 @@ import time
 
 import pygame
 
-from lib.crsf_protocol import CRSF_CHANNEL_COUNT
-from lib.rc_packet import RcPacket
+from lib import envelope
+from lib.crsf_protocol import CRSF_CHANNEL_COUNT, make_rc_frame
 
 
 MIN_US = 900
@@ -187,7 +188,9 @@ def main() -> None:
     required_axes = 8 if is_tx12 else AXIS_COUNT
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    print("Sending UDP RC to " + ", ".join(f"{host}:{port}" for host, port in targets) + ".")
+    session = envelope.new_session()
+    seq = 0
+    print("Sending protocol v1 RC to " + ", ".join(f"{host}:{port}" for host, port in targets) + ".")
 
     channels = [MID_US] * CRSF_CHANNEL_COUNT
     channels[2] = MIN_US
@@ -238,7 +241,9 @@ def main() -> None:
                     print(f"buttons={buttons} channels={channels}")
                     dbg_t = now
 
-            packet = RcPacket(int(time.time() * 1000) & 0xFFFFFFFF, tuple(channels)).encode()
+            packet = envelope.encode(
+                envelope.Kind.CRSF, session, seq, make_rc_frame(channels))
+            seq = (seq + 1) & 0xFFFFFFFF
             for target in targets:
                 sock.sendto(packet, target)
 

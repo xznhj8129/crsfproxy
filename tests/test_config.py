@@ -1,4 +1,6 @@
+import time
 import unittest
+from dataclasses import replace
 
 from lib.crsf_protocol import (
     DeviceInfo,
@@ -7,45 +9,100 @@ from lib.crsf_protocol import (
     Parameter,
     ParameterType,
 )
-from lib.elrs_backend import ElrsConfigService, ProxyConfigTransport, parse_config_request
+from lib.elrs_backend import PARAMETER_CACHE_TTL_S, ElrsConfigService
+from lib.elrs_config import WriteResult
+from lib.transport import ProxyConfigTransport
 
 
 class FakeClient:
     def __init__(self, device, parameters) -> None:
         self.device = device
-        self.parameters = parameters
+        self.parameters = list(parameters)
+        self.read_all_calls = 0
+        self.write_calls = 0
+        self.command_calls = 0
 
     def discover(self, seconds):
         return {self.device.address: self.device}
 
     def read_all(self, device):
-        return self.parameters
+        self.read_all_calls += 1
+        return list(self.parameters)
 
-    def find(self, device, name_or_id):
-        for parameter in self.parameters:
-            if str(parameter.id) == name_or_id or parameter.name == name_or_id:
-                return parameter
-        raise KeyError(name_or_id)
+    def write(self, device_address, parameter, value):
+        self.write_calls += 1
+        if parameter.type == ParameterType.SELECTION:
+            if value in parameter.options:
+                new_value = parameter.options.index(value)
+            else:
+                new_value = int(value)
+        elif parameter.type.value <= ParameterType.INT64:
+            new_value = int(value)
+        else:
+            new_value = value
+        updated = replace(parameter, value=new_value)
+        return WriteResult(updated, parameter.value, True)
+
+    def command_step(self, device_address, parameter, step):
+        self.command_calls += 1
+        return replace(parameter, command_status=0, command_timeout=0)
 
 
-class ConfigTests(unittest.TestCase):
-    def test_shell_style_set_request_preserves_quoted_names(self) -> None:
-        request = parse_config_request(
-            b'set "Packet Rate" "333Hz Full(-105dBm)"')
-        self.assertEqual(request, {
-            "command": "set",
-            "parameter": "Packet Rate",
-            "value": "333Hz Full(-105dBm)",
-        })
+def selection_parameters(count: int) -> list[Parameter]:
+    return [
+        Parameter(
+            id=index + 1,
+            parent=0,
+            type=ParameterType.SELECTION,
+            hidden=False,
+            name=f"Parameter {index + 1:02d}",
+            value=0,
+            minimum=0,
+            maximum=2,
+            default=0,
+            unit="",
+            options=("one", "two", "three"),
+        )
+        for index in range(count)
+    ]
 
-    def test_json_request(self) -> None:
-        request = parse_config_request(
-            b'{"command":"command","parameter":"Bind","confirm":true}')
-        self.assertEqual(request["parameter"], "Bind")
-        self.assertTrue(request["confirm"])
 
-    def test_info_contains_device_configuration_and_link_state(self) -> None:
-        transport = ProxyConfigTransport()
+def info_parameters() -> list[Parameter]:
+    return [
+        Parameter(1, 0, ParameterType.SELECTION, False, "RF Band",
+                  value=1, options=("915MHz", "2.4GHz")),
+        Parameter(2, 0, ParameterType.SELECTION, False, "Packet Rate",
+                  value=0, options=("333Hz",)),
+        Parameter(3, 0, ParameterType.SELECTION, False, "Link Mode",
+                  value=0, options=("Normal",)),
+        Parameter(4, 0, ParameterType.UINT8, False, "Model Id", value=7),
+        Parameter(5, 0, ParameterType.SELECTION, False, "Telem Ratio",
+                  value=0, options=("1:2",)),
+        Parameter(6, 0, ParameterType.INFO, False, "Git Hash", value="abc123"),
+    ]
+
+
+def make_service(parameters=None, device=None):
+    parameters = list(parameters or [])
+    if device is None:
+        device = DeviceInfo(0xEE, "RM Nomad", "ELRS", 0, 0x00040102,
+                            len(parameters), 0)
+    transport = ProxyConfigTransport()
+    client = FakeClient(device, parameters)
+    service = ElrsConfigService(transport)
+    service.client = client
+    return service, client, transport
+
+
+class ElrsConfigServiceTests(unittest.TestCase):
+    def test_devices_has_protocol(self) -> None:
+        service, _, _ = make_service(info_parameters())
+        result = service.execute({"command": "devices"})
+        self.assertEqual(result["protocol"], "elrs")
+        self.assertEqual(result["devices"][0]["address"], 0xEE)
+
+    def test_info_is_a_summary_with_protocol(self) -> None:
+        service, _, transport = make_service(info_parameters())
         transport.radio_rate_hz = 333.0
         transport.status = {
             "connected": True,
@@ -54,42 +111,114 @@ class ConfigTests(unittest.TestCase):
             "flags": "0x01",
             "message": "",
         }
-        device = DeviceInfo(0xEE, "RM Nomad", "ELRS", 0, 0x00040102, 3, 0)
-        parameters = [
-            Parameter(1, 0, ParameterType.SELECTION, False, "RF Band",
-                      value=1, options=("915MHz", "2.4GHz")),
-            Parameter(2, 0, ParameterType.SELECTION, False, "Packet Rate",
-                      value=0, options=("333Hz",)),
-            Parameter(3, 0, ParameterType.INFO, False, "Git Hash", value="abc123"),
-        ]
-        service = ElrsConfigService(transport)
-        service.client = FakeClient(device, parameters)
         result = service.execute({"command": "info"})
+        self.assertEqual(result["protocol"], "elrs")
         self.assertEqual(result["device"]["version"], "4.1.2")
-        self.assertEqual(result["configuration"]["RF Band"], "2.4GHz")
-        self.assertEqual(result["lua_info"]["Git Hash"], "abc123")
+        self.assertEqual(result["current_band"], "2.4GHz")
+        self.assertEqual(result["packet_rate"], "333Hz")
+        self.assertEqual(result["mode"], "Normal")
+        self.assertEqual(result["model_id"], 7)
+        self.assertEqual(result["telemetry_ratio"], "1:2")
+        self.assertEqual(result["firmware_hash"], "abc123")
         self.assertTrue(result["binding"]["connected"])
         self.assertEqual(result["radio_rate_hz"], 333.0)
+        self.assertNotIn("configuration", result)
+        self.assertNotIn("lua_info", result)
 
-    def test_params_contains_link_state_for_tui_banner(self) -> None:
-        transport = ProxyConfigTransport()
-        transport.status = {
-            "connected": False,
-            "packets_bad": 0,
-            "packets_good": 82,
-            "flags": "0x40",
-            "message": "Baud rate too low",
-        }
-        device = DeviceInfo(0xEE, "RM Nomad", "ELRS", 0, 0x00040001, 1, 0)
-        parameter = Parameter(
-            1, 0, ParameterType.SELECTION, False, "Packet Rate",
-            value=0, options=("250Hz",))
-        service = ElrsConfigService(transport)
-        service.client = FakeClient(device, [parameter])
-        result = service.execute({"command": "params"})
-        self.assertEqual(result["binding"]["message"], "Baud rate too low")
-        self.assertEqual(result["binding"]["flags"], "0x40")
+    def test_params_is_paginated_compact_and_reads_once(self) -> None:
+        service, client, _ = make_service(selection_parameters(30))
+        offset = 0
+        ids = []
+        pages = 0
+        while True:
+            result = service.execute({"command": "params", "offset": offset})
+            pages += 1
+            self.assertEqual(result["protocol"], "elrs")
+            self.assertIn("device", result)
+            self.assertIn("radio_rate_hz", result)
+            self.assertIn("binding", result)
+            self.assertEqual(result["offset"], offset)
+            self.assertEqual(result["total"], 30)
+            self.assertGreater(len(result["parameters"]), 0)
+            for parameter in result["parameters"]:
+                self.assertNotIn("options", parameter)
+            ids.extend(parameter["id"] for parameter in result["parameters"])
+            if not result["more"]:
+                break
+            offset += len(result["parameters"])
+        self.assertGreater(pages, 1)
+        self.assertEqual(ids, list(range(1, 31)))
+        self.assertEqual(client.read_all_calls, 1)
 
+    def test_params_offset_zero_refreshes_after_ttl(self) -> None:
+        service, client, _ = make_service(selection_parameters(30))
+        service.execute({"command": "params", "offset": 0})
+        service.execute({"command": "params", "offset": 1})
+        self.assertEqual(client.read_all_calls, 1)
+        service._parameters_at = time.monotonic() - PARAMETER_CACHE_TTL_S - 1
+        service.execute({"command": "params", "offset": 0})
+        self.assertEqual(client.read_all_calls, 2)
+
+    def test_params_offset_bounds(self) -> None:
+        service, _, _ = make_service(selection_parameters(30))
+        with self.assertRaises(ValueError):
+            service.execute({"command": "params", "offset": -1})
+        result = service.execute({"command": "params", "offset": 1000})
+        self.assertEqual(result["parameters"], [])
+        self.assertFalse(result["more"])
+        self.assertEqual(result["offset"], 1000)
+        self.assertEqual(result["total"], 30)
+
+    def test_params_omit_options_while_get_includes_them(self) -> None:
+        service, _, _ = make_service(selection_parameters(10))
+        params = service.execute({"command": "params", "offset": 0})
+        self.assertNotIn("options", params["parameters"][0])
+        parameter = service.execute({"command": "get", "parameter": "Parameter 01"})
+        self.assertIn("options", parameter["parameter"])
+        self.assertEqual(parameter["parameter"]["options"], ["one", "two", "three"])
+
+    def test_get_accepts_name_or_decimal_id(self) -> None:
+        service, _, _ = make_service(selection_parameters(10))
+        by_name = service.execute({"command": "get", "parameter": "Parameter 02"})
+        by_id = service.execute({"command": "get", "parameter": "3"})
+        self.assertEqual(by_name["parameter"]["id"], 2)
+        self.assertEqual(by_id["parameter"]["id"], 3)
+        with self.assertRaises((KeyError, ValueError)):
+            service.execute({"command": "get", "parameter": "missing"})
+        with self.assertRaises((KeyError, ValueError)):
+            service.execute({"command": "get", "parameter": "999"})
+
+    def test_set_invalidates_parameter_cache(self) -> None:
+        service, client, _ = make_service(selection_parameters(30))
+        service.execute({"command": "params", "offset": 0})
+        before = client.read_all_calls
+        result = service.execute(
+            {"command": "set", "parameter": "Parameter 01", "value": "1"})
+        self.assertEqual(result["protocol"], "elrs")
+        self.assertTrue(result["verified"])
+        self.assertEqual(result["old_value"], 0)
+        self.assertEqual(result["parameter"]["value"], "two")
+        self.assertIn("options", result["parameter"])
+        service.execute({"command": "params", "offset": 0})
+        self.assertEqual(client.read_all_calls, before + 1)
+
+    def test_command_invalidates_parameter_cache(self) -> None:
+        parameters = selection_parameters(3) + [
+            Parameter(99, 0, ParameterType.COMMAND, False, "Save",
+                      command_status=0, command_timeout=0, command_info="Save it"),
+        ]
+        service, client, _ = make_service(parameters)
+        service.execute({"command": "params", "offset": 0})
+        result = service.execute(
+            {"command": "command", "parameter": "Save", "step": "start"})
+        self.assertEqual(result["protocol"], "elrs")
+        self.assertIn("options", result["parameter"])
+        self.assertEqual(result["parameter"]["command_status"], 0)
+        service.execute({"command": "params", "offset": 0})
+        self.assertEqual(client.read_all_calls, 2)
+
+
+class ConfigTransportTests(unittest.TestCase):
     def test_transport_decodes_radio_rate_and_binding_status(self) -> None:
         transport = ProxyConfigTransport()
         self.assertEqual(transport.origin(0x00), 0xEA)

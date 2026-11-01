@@ -1,55 +1,181 @@
 #!/usr/bin/env python3
-"""Remote ELRS Lua configuration client for crsfproxy.
+"""Remote crsfproxy protocol v1 CONTROL client.
 
-  python3 config_client.py --port 60001 info
-  python3 config_client.py --host radio.local --port 60001 get "Packet Rate"
-  python3 config_client.py --host radio.local --port 60001 set "Packet Rate" "333Hz Full(-105dBm)"
-  python3 config_client.py --host radio.local --port 60001 command Bind --confirm
-  python3 config_client.py --host radio.local --port 60001 tui
+  python3 config_client.py info
+  python3 config_client.py --host radio.local get "Packet Rate"
+  python3 config_client.py --host radio.local set "Packet Rate" "333Hz Full(-105dBm)"
+  python3 config_client.py --host radio.local command Bind --confirm
+  python3 config_client.py --host radio.local tui
+
+The server's single protocol port defaults to 60000/udp. Requests are
+Kind.CONTROL envelopes; replies are Kind.CONTROL_REPLY envelopes matched by
+session and seq.
 """
 
 import argparse
 import curses
 import json
 import socket
+import sys
 import time
 
+from lib import envelope
 from lib.crsf_protocol import CommandStatus
 
 
 DEFAULT_HOST = "127.0.0.1"
-DEFAULT_PORT = 60001
-DEFAULT_TIMEOUT_S = 60.0
+DEFAULT_PORT = 60000
+DEFAULT_TIMEOUT_S = 30.0
+CONTROL_RETRY_INTERVAL_S = 1.0
 UDP_RESPONSE_LIMIT = 65507
 SPINNER = "|/-\\"
 WRITABLE_TYPES = {"UINT8", "INT8", "UINT16", "INT16", "UINT32", "INT32",
                   "UINT64", "INT64", "FLOAT", "SELECTION"}
 
 
-class ProxyError(RuntimeError):
-    """crsfproxy answered a configuration request with ok=false."""
+class ControlError(RuntimeError):
+    """A CONTROL request failed or timed out."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
 
 
-def udp_request(host: str, port: int, timeout: float, request: dict) -> dict:
-    payload = json.dumps(request, separators=(",", ":")).encode("utf-8")
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-        sock.settimeout(timeout)
-        sock.sendto(payload, (host, port))
-        response, sender = sock.recvfrom(UDP_RESPONSE_LIMIT)
-    decoded = json.loads(response)
-    if not decoded["ok"]:
-        raise ProxyError(f"proxy={sender[0]}:{sender[1]} error={decoded['error']}")
-    return decoded["result"]
+class ControlClient:
+    """One-session CONTROL client on one connected UDP socket."""
+
+    RETRY_INTERVAL_S = CONTROL_RETRY_INTERVAL_S
+
+    def __init__(self, host: str = DEFAULT_HOST, port: int = DEFAULT_PORT,
+                 timeout: float = DEFAULT_TIMEOUT_S,
+                 retry_interval_s: float | None = None) -> None:
+        self.host = host
+        self.port = port
+        self.timeout = timeout
+        self.retry_interval_s = (
+            self.RETRY_INTERVAL_S if retry_interval_s is None else float(retry_interval_s))
+        if self.retry_interval_s <= 0:
+            raise ValueError(f"retry_interval_s={self.retry_interval_s} must be positive")
+        self.session = envelope.new_session()
+        self.seq = 0
+        self._closed = False
+        self._socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._socket.bind(("", 0))
+        self._socket.connect((host, port))
+
+    def close(self) -> None:
+        if not self._closed:
+            self._closed = True
+            self._socket.close()
+
+    def request(self, request: dict, timeout: float | None = None) -> dict:
+        """Send one request, retrying the same datagram, and return its result."""
+        if self._closed:
+            raise ValueError("ControlClient is closed")
+        effective_timeout = self.timeout if timeout is None else float(timeout)
+        if effective_timeout <= 0:
+            raise ValueError(f"timeout={effective_timeout} must be positive")
+        seq = self.seq
+        payload = json.dumps(request, separators=(",", ":")).encode("utf-8")
+        datagram = envelope.encode(
+            envelope.Kind.CONTROL, self.session, seq, payload)
+        deadline = time.monotonic() + effective_timeout
+        retry_at = time.monotonic()
+        last_socket_error: str | None = None
+
+        while True:
+            now = time.monotonic()
+            if now >= deadline:
+                self.seq = (seq + 1) & 0xFFFFFFFF
+                message = f"no CONTROL_REPLY within {effective_timeout:g}s"
+                if last_socket_error:
+                    message += f" (last socket error: {last_socket_error})"
+                raise ControlError("timeout", message)
+            if now >= retry_at:
+                try:
+                    self._socket.send(datagram)
+                except OSError as error:
+                    last_socket_error = str(error)
+                retry_at = now + self.retry_interval_s
+            wait = min(retry_at, deadline) - time.monotonic()
+            if wait <= 0:
+                continue
+            self._socket.settimeout(wait)
+            try:
+                data = self._socket.recv(UDP_RESPONSE_LIMIT)
+            except socket.timeout:
+                continue
+            except OSError as error:
+                last_socket_error = str(error)
+                continue
+            try:
+                message = envelope.decode(data)
+            except ValueError:
+                continue
+            if (message.kind != envelope.Kind.CONTROL_REPLY
+                    or message.session != self.session
+                    or message.seq != seq):
+                continue
+            try:
+                reply = json.loads(message.payload)
+                if not isinstance(reply, dict):
+                    raise ValueError("CONTROL_REPLY payload is not a JSON object")
+            except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+                self.seq = (seq + 1) & 0xFFFFFFFF
+                raise ControlError("bad_reply", str(error)) from error
+            if reply.get("ok") is True:
+                self.seq = (seq + 1) & 0xFFFFFFFF
+                result = reply.get("result")
+                return result if isinstance(result, dict) else {}
+            error = reply.get("error")
+            if isinstance(error, dict):
+                code = str(error.get("code", "failed"))
+                error_message = str(error.get("message", ""))
+            else:
+                code = "failed"
+                error_message = str(error)
+            if code == "busy":
+                continue
+            self.seq = (seq + 1) & 0xFFFFFFFF
+            raise ControlError(code, error_message)
 
 
-def command_request(host: str, port: int, timeout: float, parameter: str,
-                    step: CommandStatus) -> dict:
+def fetch_all_params(client: ControlClient) -> dict:
+    """Fetch every compact parameter page and return one combined result."""
+    parameters: list[dict] = []
+    combined: dict = {}
+    offset = 0
+    while True:
+        page = client.request({"command": "params", "offset": offset})
+        page_parameters = page.get("parameters")
+        if not isinstance(page_parameters, list):
+            raise ControlError("bad_reply", "params reply has no parameters list")
+        for key, value in page.items():
+            if key not in ("parameters", "offset", "total", "more"):
+                combined[key] = value
+        parameters.extend(page_parameters)
+        if not page.get("more"):
+            combined["parameters"] = parameters
+            combined["offset"] = 0
+            combined["total"] = page.get("total", len(parameters))
+            combined["more"] = False
+            return combined
+        if not page_parameters:
+            raise ControlError(
+                "bad_reply",
+                f"params page offset={offset} more=1 but returned no parameters")
+        offset += len(page_parameters)
+
+
+def command_request(client: ControlClient, parameter: str,
+                    step: CommandStatus, timeout: float | None = None) -> dict:
     """Send one COMMAND step (crsf_protocol.COMMAND_STEPS); returns the parameter's new state."""
-    return udp_request(host, port, timeout, {
+    return client.request({
         "command": "command",
         "parameter": parameter,
         "step": step.name.lower(),
-    })["parameter"]
+    }, timeout)["parameter"]
 
 
 def poll_delay_s(state: dict) -> float:
@@ -81,9 +207,6 @@ def print_result(result: dict) -> None:
             f"packets_good={binding['packets_good']} packets_bad={binding['packets_bad']} "
             f"message={binding['message']!r}"
         )
-    if "configuration" in result:
-        for name, value in result["configuration"].items():
-            print(f"{name}={value!r}")
     if "devices" in result:
         for device in result["devices"]:
             print(
@@ -92,11 +215,12 @@ def print_result(result: dict) -> None:
             )
     if "parameters" in result:
         for parameter in result["parameters"]:
+            options = parameter.get("options")
+            suffix = f" options={';'.join(options)!r}" if options is not None else ""
             print(
                 f"id={parameter['id']} parent={parameter['parent']} "
                 f"type={parameter['type']} hidden={int(parameter['hidden'])} "
-                f"name={parameter['name']!r} value={parameter['value']!r} "
-                f"options={';'.join(parameter['options'])!r}"
+                f"name={parameter['name']!r} value={parameter['value']!r}{suffix}"
             )
     if "parameter" in result:
         parameter = result["parameter"]
@@ -157,7 +281,7 @@ def draw_popup(screen, lines: list[str]) -> None:
     screen.refresh()
 
 
-def run_command_popup(screen, host: str, port: int, timeout: float, parameter: dict) -> str:
+def run_command_popup(screen, client: ControlClient, timeout: float, parameter: dict) -> str:
     """Run a COMMAND like elrs.lua's popup; returns the status-line text.
 
     Shows the device's own confirmation text and progress info, polls every
@@ -168,13 +292,13 @@ def run_command_popup(screen, host: str, port: int, timeout: float, parameter: d
     target = str(parameter["id"])
     cancelled = False
     spin = 0
-    state = command_request(host, port, timeout, target, CommandStatus.START)
+    state = command_request(client, target, CommandStatus.START, timeout)
     while state["command_status"] != CommandStatus.READY:
         if state["command_status"] == CommandStatus.CONFIRMATION_NEEDED:
             draw_popup(screen, [name, state["command_info"], "", "[y] confirm   [any other key] cancel"])
             step = CommandStatus.CONFIRM if screen.getch() in (ord("y"), ord("Y")) else CommandStatus.CANCEL
             cancelled = step == CommandStatus.CANCEL
-            state = command_request(host, port, timeout, target, step)
+            state = command_request(client, target, step, timeout)
             continue
         draw_popup(screen, [name, f"{state['command_info']} [{SPINNER[spin % len(SPINNER)]}]", "",
                             "[Esc] cancel"])
@@ -184,26 +308,23 @@ def run_command_popup(screen, host: str, port: int, timeout: float, parameter: d
         screen.timeout(-1)
         if key in (27, curses.KEY_LEFT):
             cancelled = True
-            state = command_request(host, port, timeout, target, CommandStatus.CANCEL)
+            state = command_request(client, target, CommandStatus.CANCEL, timeout)
         else:
-            state = command_request(host, port, timeout, target, CommandStatus.POLL)
+            state = command_request(client, target, CommandStatus.POLL, timeout)
     if cancelled:
         return f"command {name!r} cancelled"
     info = state["command_info"].strip()
     return f"command {name!r} finished" + (f": {info}" if info else "")
 
 
-def run_tui(screen, host: str, port: int, timeout: float) -> None:
+def run_tui(screen, client: ControlClient, timeout: float) -> None:
     curses.curs_set(0)
     curses.set_escdelay(25)
     selected = 0
     status = ""
     parent_stack = [0]
     while True:
-        result = udp_request(host, port, timeout, {"command": "params"})
-        if "binding" not in result:
-            status_result = udp_request(host, port, timeout, {"command": "info"})
-            result["binding"] = status_result["binding"]
+        result = fetch_all_params(client)
         all_parameters = result["parameters"]
         while True:
             parameters = [
@@ -266,19 +387,23 @@ def run_tui(screen, host: str, port: int, timeout: float) -> None:
                     selected = 0
                     status = ""
                     continue
-                # A failed action (proxy error reply, or no reply in time) is
+                # A failed action (CONTROL error reply, or no reply in time) is
                 # shown on the status line; the TUI keeps running.
                 try:
                     if parameter["type"] == "SELECTION":
-                        value = choose_option(screen, parameter)
+                        full_parameter = client.request({
+                            "command": "get",
+                            "parameter": str(parameter["id"]),
+                        }, timeout)["parameter"]
+                        value = choose_option(screen, full_parameter)
                         if value is None:
                             status = f"edit {parameter['name']!r} cancelled"
                             continue
-                        response = udp_request(host, port, timeout, {
+                        response = client.request({
                             "command": "set",
                             "parameter": str(parameter["id"]),
                             "value": value,
-                        })
+                        }, timeout)
                         status = (
                             f"{parameter['name']}={response['parameter']['value']!r} "
                             f"verified={int(response['verified'])}"
@@ -286,26 +411,26 @@ def run_tui(screen, host: str, port: int, timeout: float) -> None:
                         break
                     if parameter["type"] in WRITABLE_TYPES:
                         value = prompt_value(screen, parameter)
-                        response = udp_request(host, port, timeout, {
+                        response = client.request({
                             "command": "set",
                             "parameter": str(parameter["id"]),
                             "value": value,
-                        })
+                        }, timeout)
                         status = (
                             f"{parameter['name']}={response['parameter']['value']!r} "
                             f"verified={int(response['verified'])}"
                         )
                         break
                     if parameter["type"] == "COMMAND":
-                        status = run_command_popup(screen, host, port, timeout, parameter)
+                        status = run_command_popup(screen, client, timeout, parameter)
                         break
-                except (ProxyError, TimeoutError) as error:
-                    status = f"{parameter['name']!r} failed: {error}"
+                except ControlError as error:
+                    status = f"{parameter['name']!r} failed: {error.code}: {error.message}"
                     continue
                 status = f"{parameter['name']!r} is read-only"
 
 
-def run_command_cli(host: str, port: int, timeout: float, name_or_id: str,
+def run_command_cli(client: ControlClient, timeout: float, name_or_id: str,
                     assume_yes: bool) -> tuple[dict, int]:
     """Run a COMMAND from the shell; returns (final state, exit code).
 
@@ -313,10 +438,10 @@ def run_command_cli(host: str, port: int, timeout: float, name_or_id: str,
     stdin (or answered yes by --confirm), progress is printed on one line,
     and Ctrl-C sends CANCEL before exiting.
     """
-    target = str(udp_request(host, port, timeout, {"command": "get", "parameter": name_or_id})
+    target = str(client.request({"command": "get", "parameter": name_or_id}, timeout)
                  ["parameter"]["id"])
     try:
-        state = command_request(host, port, timeout, target, CommandStatus.START)
+        state = command_request(client, target, CommandStatus.START, timeout)
         while state["command_status"] != CommandStatus.READY:
             if state["command_status"] == CommandStatus.CONFIRMATION_NEEDED:
                 if assume_yes:
@@ -327,15 +452,15 @@ def run_command_cli(host: str, port: int, timeout: float, name_or_id: str,
                     except EOFError:
                         answer = ""
                 if answer.strip().casefold() != "y":
-                    return command_request(host, port, timeout, target, CommandStatus.CANCEL), 1
-                state = command_request(host, port, timeout, target, CommandStatus.CONFIRM)
+                    return command_request(client, target, CommandStatus.CANCEL, timeout), 1
+                state = command_request(client, target, CommandStatus.CONFIRM, timeout)
                 continue
             print(f"\r{state['command_info']} (Ctrl-C to cancel)", end="", flush=True)
             time.sleep(poll_delay_s(state))
-            state = command_request(host, port, timeout, target, CommandStatus.POLL)
+            state = command_request(client, target, CommandStatus.POLL, timeout)
     except KeyboardInterrupt:
         print()
-        return command_request(host, port, timeout, target, CommandStatus.CANCEL), 130
+        return command_request(client, target, CommandStatus.CANCEL, timeout), 130
     print()
     return state, 0
 
@@ -363,29 +488,41 @@ def main() -> int:
     commands.add_parser("tui")
     args = parser.parse_args()
 
-    if args.command == "tui":
-        curses.wrapper(run_tui, args.host, args.port, args.timeout)
-        return 0
-    if args.command == "command":
-        state, code = run_command_cli(args.host, args.port, args.timeout, args.parameter, args.confirm)
-        print(json.dumps(state, indent=2) if args.json else
-              f"command {state['name']!r} {'finished' if code == 0 else 'cancelled'} "
-              f"status={state['command_status']} info={state['command_info'].strip()!r}")
-        return code
+    client = ControlClient(args.host, args.port, args.timeout)
+    try:
+        if args.command == "tui":
+            curses.wrapper(run_tui, client, args.timeout)
+            return 0
+        if args.command == "command":
+            state, code = run_command_cli(client, args.timeout, args.parameter, args.confirm)
+            print(json.dumps(state, indent=2) if args.json else
+                  f"command {state['name']!r} {'finished' if code == 0 else 'cancelled'} "
+                  f"status={state['command_status']} info={state['command_info'].strip()!r}")
+            return code
 
-    request = {"command": args.command}
-    if hasattr(args, "parameter"):
-        request["parameter"] = args.parameter
-    if hasattr(args, "value"):
-        request["value"] = args.value
-    result = udp_request(args.host, args.port, args.timeout, request)
-    if args.json:
-        print(json.dumps(result, indent=2))
-    else:
-        print_result(result)
-    if "verified" in result and not result["verified"]:
-        return 2
-    return 0
+        if args.command == "params":
+            result = fetch_all_params(client)
+        else:
+            request = {"command": args.command}
+            if hasattr(args, "parameter"):
+                request["parameter"] = args.parameter
+            if hasattr(args, "value"):
+                request["value"] = args.value
+            result = client.request(request, args.timeout)
+        if args.json:
+            print(json.dumps(result, indent=2))
+        else:
+            print_result(result)
+        if "verified" in result and not result["verified"]:
+            return 2
+        return 0
+    except KeyboardInterrupt:
+        return 130
+    except ControlError as error:
+        print(f"error[{error.code}]: {error.message}", file=sys.stderr)
+        return 1
+    finally:
+        client.close()
 
 
 if __name__ == "__main__":
