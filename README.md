@@ -27,12 +27,13 @@ The server does not interpret channel values and never generates them.
 Three links:
 
 - **user↔server** — UDP over IP. It may cross the internet; run it inside a VPN.
-- **server↔device** — local serial, or a transparent TCP byte pipe
-  (`--device socket://host:port`). The bridge parses nothing; crsfproxy owns the
-  CRSF conversation with the module.
+- **server↔node** — a transparent TCP byte pipe to a node such as the ESP32-P4
+  (`--device socket://host:port`). The node parses nothing; crsfproxy owns the
+  CRSF conversation with the module. With the module on a local serial port
+  there is no server↔node link.
 - **ground↔air** — the radio link.
 
-A serial cable is part of a link, not a link of its own. The two directions are
+Serial cables are not links. The two directions are
 independent: RC goes up, telemetry comes down, and neither waits for the other.
 
 ## One protocol

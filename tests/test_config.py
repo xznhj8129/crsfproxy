@@ -9,9 +9,14 @@ from lib.crsf_protocol import (
     Parameter,
     ParameterType,
 )
+from lib.config import ControlRequest
 from lib.elrs_backend import PARAMETER_CACHE_TTL_S, ElrsConfigService
 from lib.elrs_config import WriteResult
 from lib.transport import ProxyConfigTransport
+
+
+def run(service, data: dict) -> dict:
+    return service.execute(ControlRequest.from_json(data))
 
 
 class FakeClient:
@@ -21,6 +26,13 @@ class FakeClient:
         self.read_all_calls = 0
         self.write_calls = 0
         self.command_calls = 0
+
+    def read(self, device_address, parameter_id):
+        self.live_reads = getattr(self, "live_reads", 0) + 1
+        for parameter in self.parameters:
+            if parameter.id == parameter_id:
+                return parameter
+        raise TimeoutError(f"parameter_id={parameter_id}")
 
     def discover(self, seconds):
         return {self.device.address: self.device}
@@ -97,7 +109,7 @@ def make_service(parameters=None, device=None):
 class ElrsConfigServiceTests(unittest.TestCase):
     def test_devices_has_protocol(self) -> None:
         service, _, _ = make_service(info_parameters())
-        result = service.execute({"command": "devices"})
+        result = run(service, {"command": "devices"})
         self.assertEqual(result["protocol"], "elrs")
         self.assertEqual(result["devices"][0]["address"], 0xEE)
 
@@ -111,7 +123,7 @@ class ElrsConfigServiceTests(unittest.TestCase):
             "flags": "0x01",
             "message": "",
         }
-        result = service.execute({"command": "info"})
+        result = run(service, {"command": "info"})
         self.assertEqual(result["protocol"], "elrs")
         self.assertEqual(result["device"]["version"], "4.1.2")
         self.assertEqual(result["current_band"], "2.4GHz")
@@ -131,7 +143,7 @@ class ElrsConfigServiceTests(unittest.TestCase):
         ids = []
         pages = 0
         while True:
-            result = service.execute({"command": "params", "offset": offset})
+            result = run(service, {"command": "params", "offset": offset})
             pages += 1
             self.assertEqual(result["protocol"], "elrs")
             self.assertIn("device", result)
@@ -152,18 +164,18 @@ class ElrsConfigServiceTests(unittest.TestCase):
 
     def test_params_offset_zero_refreshes_after_ttl(self) -> None:
         service, client, _ = make_service(selection_parameters(30))
-        service.execute({"command": "params", "offset": 0})
-        service.execute({"command": "params", "offset": 1})
+        run(service, {"command": "params", "offset": 0})
+        run(service, {"command": "params", "offset": 1})
         self.assertEqual(client.read_all_calls, 1)
         service._parameters_at = time.monotonic() - PARAMETER_CACHE_TTL_S - 1
-        service.execute({"command": "params", "offset": 0})
+        run(service, {"command": "params", "offset": 0})
         self.assertEqual(client.read_all_calls, 2)
 
     def test_params_offset_bounds(self) -> None:
         service, _, _ = make_service(selection_parameters(30))
         with self.assertRaises(ValueError):
-            service.execute({"command": "params", "offset": -1})
-        result = service.execute({"command": "params", "offset": 1000})
+            run(service, {"command": "params", "offset": -1})
+        result = run(service, {"command": "params", "offset": 1000})
         self.assertEqual(result["parameters"], [])
         self.assertFalse(result["more"])
         self.assertEqual(result["offset"], 1000)
@@ -171,35 +183,35 @@ class ElrsConfigServiceTests(unittest.TestCase):
 
     def test_params_omit_options_while_get_includes_them(self) -> None:
         service, _, _ = make_service(selection_parameters(10))
-        params = service.execute({"command": "params", "offset": 0})
+        params = run(service, {"command": "params", "offset": 0})
         self.assertNotIn("options", params["parameters"][0])
-        parameter = service.execute({"command": "get", "parameter": "Parameter 01"})
+        parameter = run(service, {"command": "get", "parameter": "Parameter 01"})
         self.assertIn("options", parameter["parameter"])
         self.assertEqual(parameter["parameter"]["options"], ["one", "two", "three"])
 
     def test_get_accepts_name_or_decimal_id(self) -> None:
         service, _, _ = make_service(selection_parameters(10))
-        by_name = service.execute({"command": "get", "parameter": "Parameter 02"})
-        by_id = service.execute({"command": "get", "parameter": "3"})
+        by_name = run(service, {"command": "get", "parameter": "Parameter 02"})
+        by_id = run(service, {"command": "get", "parameter": "3"})
         self.assertEqual(by_name["parameter"]["id"], 2)
         self.assertEqual(by_id["parameter"]["id"], 3)
         with self.assertRaises((KeyError, ValueError)):
-            service.execute({"command": "get", "parameter": "missing"})
+            run(service, {"command": "get", "parameter": "missing"})
         with self.assertRaises((KeyError, ValueError)):
-            service.execute({"command": "get", "parameter": "999"})
+            run(service, {"command": "get", "parameter": "999"})
 
     def test_set_invalidates_parameter_cache(self) -> None:
         service, client, _ = make_service(selection_parameters(30))
-        service.execute({"command": "params", "offset": 0})
+        run(service, {"command": "params", "offset": 0})
         before = client.read_all_calls
-        result = service.execute(
+        result = run(service, 
             {"command": "set", "parameter": "Parameter 01", "value": "1"})
         self.assertEqual(result["protocol"], "elrs")
         self.assertTrue(result["verified"])
         self.assertEqual(result["old_value"], 0)
         self.assertEqual(result["parameter"]["value"], "two")
         self.assertIn("options", result["parameter"])
-        service.execute({"command": "params", "offset": 0})
+        run(service, {"command": "params", "offset": 0})
         self.assertEqual(client.read_all_calls, before + 1)
 
     def test_command_invalidates_parameter_cache(self) -> None:
@@ -208,13 +220,13 @@ class ElrsConfigServiceTests(unittest.TestCase):
                       command_status=0, command_timeout=0, command_info="Save it"),
         ]
         service, client, _ = make_service(parameters)
-        service.execute({"command": "params", "offset": 0})
-        result = service.execute(
+        run(service, {"command": "params", "offset": 0})
+        result = run(service, 
             {"command": "command", "parameter": "Save", "step": "start"})
         self.assertEqual(result["protocol"], "elrs")
         self.assertIn("options", result["parameter"])
         self.assertEqual(result["parameter"]["command_status"], 0)
-        service.execute({"command": "params", "offset": 0})
+        run(service, {"command": "params", "offset": 0})
         self.assertEqual(client.read_all_calls, 2)
 
 

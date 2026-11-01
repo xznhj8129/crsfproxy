@@ -12,7 +12,7 @@ Per radio, and nothing else:
   transport_type     ProxyConfigTransport (sub)class: which inbound frames
                      reach the configuration service
   service_type       constructed with the transport; execute(request) runs a
-                     parsed CONTROL request (info, devices, params, get, set,
+                     typed ControlRequest (info, devices, params, get, set,
                      and one COMMAND step per request, see
                      crsf_protocol.COMMAND_STEPS) against the module and
                      returns the JSON-ready result
@@ -30,11 +30,12 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol
 
 if TYPE_CHECKING:
+    from .config import ControlRequest
     from .transport import ProxyConfigTransport
 
 
 class ConfigService(Protocol):
-    def execute(self, request: dict) -> dict: ...
+    def execute(self, request: ControlRequest) -> dict: ...
 
 
 @dataclass(frozen=True)

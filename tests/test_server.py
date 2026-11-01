@@ -1,16 +1,17 @@
+import json
 import unittest
 
+from lib.config import ControlCommand, ControlErrorCode, ControlReply, ControlRequest
 from lib.server import (
-    ERROR_BAD_REQUEST,
-    ERROR_BUSY,
-    ERROR_FAILED,
-    ERROR_STALE,
+    CACHEABLE_ERROR_CODES,
     ControlJob,
     ControlSessions,
     ControlWorker,
     RcOwner,
-    _cacheable_reply,
+    RcResult,
+    _reply_payload,
 )
+from lib.transport import ProxyConfigTransport
 
 
 PEER_A = ("127.0.0.1", 50000)
@@ -28,7 +29,7 @@ class ControlSessionsTests(unittest.TestCase):
 
     def test_reply_is_retained_for_ttl_then_expires(self) -> None:
         sessions = ControlSessions(ttl_s=60.0)
-        reply = {"ok": True, "result": {}}
+        reply = ControlReply(result={})
         sessions.complete(PEER_A, 7, 3, reply, now=100.0)
         self.assertIs(sessions.cached(PEER_A, 7, 3, 160.0), reply)
         self.assertIsNone(sessions.cached(PEER_A, 7, 3, 160.001))
@@ -36,7 +37,7 @@ class ControlSessionsTests(unittest.TestCase):
     def test_prune_expires_cache_but_keeps_high_water(self) -> None:
         sessions = ControlSessions(ttl_s=60.0)
         sessions.complete(
-            PEER_A, 7, 3, {"ok": True, "result": {}}, now=100.0)
+            PEER_A, 7, 3, ControlReply(result={}), now=100.0)
         sessions.prune(161.0)
         self.assertIsNone(sessions.cached(PEER_A, 7, 3, 161.0))
         self.assertFalse(sessions.is_new(PEER_A, 7, 3))
@@ -78,7 +79,7 @@ class ControlSessionsTests(unittest.TestCase):
     def test_newer_seq_is_new(self) -> None:
         sessions = ControlSessions()
         self.assertTrue(sessions.is_new(PEER_A, 7, 5))
-        sessions.complete(PEER_A, 7, 5, {"ok": True, "result": {}}, now=1.0)
+        sessions.complete(PEER_A, 7, 5, ControlReply(result={}), now=1.0)
         self.assertFalse(sessions.is_new(PEER_A, 7, 5))
         self.assertFalse(sessions.is_new(PEER_A, 7, 4))
         self.assertTrue(sessions.is_new(PEER_A, 7, 6))
@@ -86,41 +87,37 @@ class ControlSessionsTests(unittest.TestCase):
     def test_wrap(self) -> None:
         sessions = ControlSessions()
         sessions.complete(
-            PEER_A, 7, 0xFFFFFFFF, {"ok": True, "result": {}}, now=1.0)
+            PEER_A, 7, 0xFFFFFFFF, ControlReply(result={}), now=1.0)
         self.assertTrue(sessions.is_new(PEER_A, 7, 0))
         self.assertFalse(sessions.is_new(PEER_A, 7, 0xFFFFFFFE))
-        sessions.complete(PEER_A, 7, 0, {"ok": True, "result": {}}, now=2.0)
+        sessions.complete(PEER_A, 7, 0, ControlReply(result={}), now=2.0)
         self.assertTrue(sessions.is_new(PEER_A, 7, 1))
 
 
 class ControlReplyCacheRuleTests(unittest.TestCase):
     def test_only_success_and_failed_are_cached(self) -> None:
-        self.assertTrue(_cacheable_reply({"ok": True, "result": {}}))
-        self.assertTrue(
-            _cacheable_reply(
-                {"ok": False, "error": {"code": ERROR_FAILED, "message": ""}}))
-        for code in (ERROR_BAD_REQUEST, ERROR_BUSY, ERROR_STALE):
-            self.assertFalse(
-                _cacheable_reply(
-                    {"ok": False, "error": {"code": code, "message": ""}}))
+        self.assertIn(ControlReply(result={}).error_code, CACHEABLE_ERROR_CODES)
+        self.assertIn(ControlErrorCode.FAILED, CACHEABLE_ERROR_CODES)
+        for code in (ControlErrorCode.BAD_REQUEST, ControlErrorCode.BUSY, ControlErrorCode.STALE):
+            self.assertNotIn(code, CACHEABLE_ERROR_CODES)
 
 
 class RcOwnerTests(unittest.TestCase):
     def test_accept_stale_and_foreign(self) -> None:
         owner = RcOwner(1000)
-        self.assertEqual(owner.accept(PEER_A, 7, 0, b"a0", 0.0), "accepted")
+        self.assertEqual(owner.accept(PEER_A, 7, 0, b"a0", 0.0), RcResult.ACCEPTED)
         self.assertTrue(owner.is_owner(PEER_A, 7))
         self.assertEqual(owner.last_frame, b"a0")
         self.assertEqual(owner.last_seq, 0)
         self.assertEqual(owner.last_session, 7)
         self.assertEqual(owner.last_at, 0.0)
 
-        self.assertEqual(owner.accept(PEER_A, 7, 0, b"a0b", 0.1), "stale")
+        self.assertEqual(owner.accept(PEER_A, 7, 0, b"a0b", 0.1), RcResult.STALE)
         self.assertEqual(owner.last_frame, b"a0")
-        self.assertEqual(owner.accept(PEER_A, 7, 5, b"a5", 0.2), "accepted")
+        self.assertEqual(owner.accept(PEER_A, 7, 5, b"a5", 0.2), RcResult.ACCEPTED)
         self.assertEqual(owner.last_frame, b"a5")
-        self.assertEqual(owner.accept(PEER_B, 7, 6, b"b6", 0.3), "foreign")
-        self.assertEqual(owner.accept(PEER_A, 8, 6, b"a8", 0.3), "foreign")
+        self.assertEqual(owner.accept(PEER_B, 7, 6, b"b6", 0.3), RcResult.FOREIGN)
+        self.assertEqual(owner.accept(PEER_A, 8, 6, b"a8", 0.3), RcResult.FOREIGN)
         self.assertTrue(owner.is_owner(PEER_A, 7))
         self.assertEqual(owner.last_frame, b"a5")
 
@@ -133,10 +130,10 @@ class RcOwnerTests(unittest.TestCase):
         self.assertEqual(owner.last_seq, 10)
         self.assertFalse(owner.is_owner(PEER_A, 7))
 
-        self.assertEqual(owner.accept(PEER_A, 7, 10, b"a10b", 1.1), "stale")
-        self.assertEqual(owner.accept(PEER_A, 7, 9, b"a9", 1.1), "stale")
+        self.assertEqual(owner.accept(PEER_A, 7, 10, b"a10b", 1.1), RcResult.STALE)
+        self.assertEqual(owner.accept(PEER_A, 7, 9, b"a9", 1.1), RcResult.STALE)
         self.assertIsNone(owner.owner)
-        self.assertEqual(owner.accept(PEER_A, 7, 11, b"a11", 1.2), "accepted")
+        self.assertEqual(owner.accept(PEER_A, 7, 11, b"a11", 1.2), RcResult.ACCEPTED)
         self.assertTrue(owner.is_owner(PEER_A, 7))
         self.assertEqual(owner.last_frame, b"a11")
 
@@ -144,14 +141,14 @@ class RcOwnerTests(unittest.TestCase):
         owner = RcOwner(1000)
         owner.accept(PEER_A, 7, 10, b"a10", 0.0)
         self.assertTrue(owner.release_if_stale(1.0))
-        self.assertEqual(owner.accept(PEER_A, 8, 0, b"b0", 1.1), "accepted")
+        self.assertEqual(owner.accept(PEER_A, 8, 0, b"b0", 1.1), RcResult.ACCEPTED)
         self.assertTrue(owner.is_owner(PEER_A, 8))
         self.assertFalse(owner.is_owner(PEER_A, 7))
         self.assertEqual(owner.last_frame, b"b0")
 
     def test_another_peer_becomes_owner_when_no_owner(self) -> None:
         owner = RcOwner(1000)
-        self.assertEqual(owner.accept(PEER_B, 9, 3, b"b3", 0.0), "accepted")
+        self.assertEqual(owner.accept(PEER_B, 9, 3, b"b3", 0.0), RcResult.ACCEPTED)
         self.assertTrue(owner.is_owner(PEER_B, 9))
 
 
@@ -160,70 +157,61 @@ class FakeService:
         self.outcome = outcome
         self.requests = []
 
-    def execute(self, request: dict) -> dict:
+    def execute(self, request: ControlRequest) -> dict:
         self.requests.append(request)
         if isinstance(self.outcome, Exception):
             raise self.outcome
         return self.outcome
 
 
+INFO = ControlRequest(ControlCommand.INFO)
+
+
 class ControlWorkerTests(unittest.TestCase):
-    def run_job(self, worker: ControlWorker, request: dict) -> dict:
-        job = ControlJob(PEER_A, 7, 0, request)
-        worker.submit(job)
-        return worker.done.get(timeout=2.0).reply
+    def run_job(self, outcome, request: ControlRequest = INFO) -> tuple[ControlReply, FakeService]:
+        service = FakeService(outcome)
+        worker = ControlWorker(service, ProxyConfigTransport())
+        try:
+            worker.submit(ControlJob(PEER_A, 7, 0, request))
+            return worker.done.get(timeout=2.0).reply, service
+        finally:
+            worker.stop()
 
     def test_success(self) -> None:
-        service = FakeService({"protocol": "elrs"})
-        worker = ControlWorker(service)
-        try:
-            reply = self.run_job(worker, {"command": "info"})
-        finally:
-            worker.stop()
-        self.assertEqual(reply, {"ok": True, "result": {"protocol": "elrs"}})
-        self.assertEqual(service.requests, [{"command": "info"}])
+        reply, service = self.run_job({"protocol": "elrs"})
+        self.assertEqual(reply, ControlReply(result={"protocol": "elrs"}))
+        self.assertEqual(service.requests, [INFO])
 
     def test_key_error_is_bad_request(self) -> None:
-        service = FakeService(KeyError("missing parameter"))
-        worker = ControlWorker(service)
-        try:
-            reply = self.run_job(worker, {"command": "get", "parameter": "missing"})
-        finally:
-            worker.stop()
-        self.assertFalse(reply["ok"])
-        self.assertEqual(reply["error"]["code"], ERROR_BAD_REQUEST)
-        self.assertIn("missing parameter", reply["error"]["message"])
+        reply, _ = self.run_job(KeyError("missing parameter"),
+                                ControlRequest(ControlCommand.GET, parameter="missing"))
+        self.assertEqual(reply.error_code, ControlErrorCode.BAD_REQUEST)
+        self.assertIn("missing parameter", reply.message)
 
     def test_timeout_error_is_failed(self) -> None:
-        service = FakeService(TimeoutError("device timeout"))
-        worker = ControlWorker(service)
-        try:
-            reply = self.run_job(worker, {"command": "info"})
-        finally:
-            worker.stop()
-        self.assertFalse(reply["ok"])
-        self.assertEqual(reply["error"]["code"], ERROR_FAILED)
-        self.assertIn("device timeout", reply["error"]["message"])
+        reply, _ = self.run_job(TimeoutError("device timeout"))
+        self.assertEqual(reply.error_code, ControlErrorCode.FAILED)
+        self.assertIn("device timeout", reply.message)
 
     def test_oversized_reply_becomes_failed(self) -> None:
-        service = FakeService({"data": "x" * 70000})
-        worker = ControlWorker(service)
-        try:
-            reply = self.run_job(worker, {"command": "info"})
-        finally:
-            worker.stop()
-        self.assertFalse(reply["ok"])
-        self.assertEqual(reply["error"]["code"], ERROR_FAILED)
+        reply, _ = self.run_job({"data": "x" * 70000})
+        decoded = json.loads(_reply_payload(reply))
+        self.assertFalse(decoded["ok"])
+        self.assertEqual(decoded["error"]["code"], ControlErrorCode.FAILED.value)
 
-    def test_oversized_error_reply_becomes_failed(self) -> None:
-        service = FakeService(ValueError("x" * 70000))
-        worker = ControlWorker(service)
-        try:
-            reply = self.run_job(worker, {"command": "info"})
-        finally:
-            worker.stop()
-        self.assertFalse(reply["ok"])
-        self.assertEqual(reply["error"]["code"], ERROR_FAILED)
+
+class ControlRequestTests(unittest.TestCase):
+    def test_round_trip(self) -> None:
+        request = ControlRequest.from_json(
+            {"command": "command", "parameter": "Bind", "step": "start"})
+        self.assertEqual(ControlRequest.from_json(request.to_json()), request)
+
+    def test_invalid_requests(self) -> None:
+        for data in ({"command": "nope"}, {"command": "get"}, {"command": "set", "parameter": "x"},
+                     {"command": "command", "parameter": "Bind", "step": "go"},
+                     {"command": "params", "offset": -1}):
+            with self.assertRaises(ValueError):
+                ControlRequest.from_json(data)
 
 
 if __name__ == "__main__":

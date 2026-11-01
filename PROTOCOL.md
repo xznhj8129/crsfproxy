@@ -12,10 +12,10 @@ the same rules.
 | Link | Medium | Covered here |
 |---|---|---|
 | **user↔server** | any IP path, possibly the internet, always inside a VPN | yes |
-| **server↔device** | LAN: raw CRSF bytes over a serial port or TCP (`socket://host:port`) | no |
+| **server↔node** | LAN: raw CRSF bytes over TCP to a node such as the ESP32-P4 (`socket://host:port`) | no |
 | **ground↔air** | ExpressLRS RF | no |
 
-A serial cable is part of a link, not a link of its own.
+Serial cables are not links. With the TX module on a local serial port there is no server↔node link.
 
 ## Terms
 
@@ -117,6 +117,9 @@ A request to the server itself. The payload is a UTF-8 JSON object with a
 | `{"command":"get","parameter":P}` | `protocol`, `parameter` (full) |
 | `{"command":"set","parameter":P,"value":V}` | `protocol`, `verified`, `old_value`, `parameter` (full, read back) |
 | `{"command":"command","parameter":P,"step":S}` | `protocol`, `parameter` (full, with the command's new state) |
+
+`info` and `params` read a parameter table that is cached for up to 30 s; `set` and
+`command` clear it. `get` locates the parameter in that table and reads its value live.
 
 **`info` result**
 
@@ -363,7 +366,7 @@ Shared rules the server does not enforce:
 | Link | Uplink | Downlink |
 |---|---|---|
 | user↔server | STATUS: `rc_age_ms`, counters, RTT | gaps in the server's per-kind seq |
-| server↔device | ELRS status `packets_good` / `packets_bad` | STATUS: `device_rx_age_ms` |
+| server↔node | ELRS status `packets_good` / `packets_bad` | STATUS: `device_rx_age_ms` |
 | ground↔air | ELRS `LINK_STATISTICS` | ELRS `LINK_STATISTICS` |
 
 ## Failure behavior
@@ -386,7 +389,7 @@ What the device does next is outside this protocol.
 - The receiver and flight controller failsafe follows from that.
 - mLRS has not been checked.
 
-**server↔device lost**
+**server↔node lost**
 
 - With `socket://`, a dropped connection makes the server exit.
 - Run it under a service manager that restarts it.

@@ -7,6 +7,9 @@ from contextlib import contextmanager
 
 from lib import envelope
 from config_client import ControlClient, ControlError, fetch_all_params
+from lib.config import ControlCommand, ControlRequest
+
+INFO = ControlRequest(ControlCommand.INFO)
 
 
 class FakeControlServer(threading.Thread):
@@ -74,7 +77,7 @@ class ControlClientTests(unittest.TestCase):
             return {"ok": True, "result": {"echo": request}}
 
         with self.control_pair(handler) as (server, client):
-            result = client.request({"command": "info"})
+            result = client.request(INFO)
 
         self.assertEqual(result, {"echo": {"command": "info"}})
         self.assertEqual(client.seq, 1)
@@ -93,7 +96,7 @@ class ControlClientTests(unittest.TestCase):
 
         started = time.monotonic()
         with self.control_pair(handler) as (server, client):
-            result = client.request({"command": "info"})
+            result = client.request(INFO)
         elapsed = time.monotonic() - started
 
         self.assertEqual(result, {"count": 2})
@@ -110,7 +113,7 @@ class ControlClientTests(unittest.TestCase):
 
         with self.control_pair(handler, timeout=0.2) as (server, client):
             with self.assertRaises(ControlError) as caught:
-                client.request({"command": "info"})
+                client.request(INFO)
         self.assertEqual(caught.exception.code, "timeout")
         self.assertGreaterEqual(len(server.requests), 2)
         self.assertEqual(server.requests[0][0].seq, server.requests[-1][0].seq)
@@ -127,7 +130,7 @@ class ControlClientTests(unittest.TestCase):
 
                 with self.control_pair(handler) as (server, client):
                     with self.assertRaises(ControlError) as caught:
-                        client.request({"command": "info"})
+                        client.request(INFO)
                 self.assertEqual(caught.exception.code, code)
                 self.assertEqual(caught.exception.message, f"{code} message")
                 self.assertEqual(client.seq, 1)

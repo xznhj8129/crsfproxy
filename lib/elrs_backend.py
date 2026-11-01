@@ -12,7 +12,8 @@ import time
 from . import transport
 from .config import (
     DEFAULT_PARAMETER_TIMEOUT_S,
-    command_step_from_request,
+    ControlCommand,
+    ControlRequest,
     device_dict,
     parameter_dict,
     parameter_page,
@@ -84,16 +85,8 @@ class ElrsConfigService:
         raise KeyError(
             f"parameter {text!r} not found on device 0x{self.transmitter().address:02X}")
 
-    @staticmethod
-    def _offset(request: dict) -> int:
-        try:
-            return int(request.get("offset", 0))
-        except (TypeError, ValueError) as error:
-            raise ValueError(f"offset={request.get('offset')!r} must be an integer") from error
-
-    def execute(self, request: dict) -> dict:
-        command = request["command"].casefold()
-        if command == "devices":
+    def execute(self, request: ControlRequest) -> dict:
+        if request.command == ControlCommand.DEVICES:
             devices = self.client.discover(CONFIG_DEVICE_DISCOVERY_S)
             return {
                 "protocol": "elrs",
@@ -101,23 +94,20 @@ class ElrsConfigService:
             }
 
         transmitter = self.transmitter()
-        if command == "params":
-            offset = self._offset(request)
-            if offset < 0:
-                raise ValueError(f"offset={offset} must be >= 0")
-            parameters = self._parameter_table(allow_stale=offset > 0)
-            page, more = parameter_page(parameters, offset)
+        if request.command == ControlCommand.PARAMS:
+            parameters = self._parameter_table(allow_stale=request.offset > 0)
+            page, more = parameter_page(parameters, request.offset)
             result = {
                 "protocol": "elrs",
                 "device": device_dict(transmitter),
                 "parameters": page,
-                "offset": offset,
+                "offset": request.offset,
                 "total": len(parameters),
                 "more": more,
             }
             result.update(self.transport.snapshot())
             return result
-        if command == "info":
+        if request.command == ControlCommand.INFO:
             parameters = self._parameter_table()
             values = {
                 parameter.name: parameter_value(parameter)
@@ -142,13 +132,14 @@ class ElrsConfigService:
             result.update(self.transport.snapshot())
             return result
 
-        parameter = self._find_parameter(request["parameter"])
-        if command == "get":
-            return {"protocol": "elrs", "parameter": parameter_dict(parameter)}
-        if command == "set":
+        parameter = self._find_parameter(request.parameter)
+        if request.command == ControlCommand.GET:
+            # The table only locates the parameter; its value is read live.
+            live = self.client.read(transmitter.address, parameter.id)
+            return {"protocol": "elrs", "parameter": parameter_dict(live)}
+        if request.command == ControlCommand.SET:
             try:
-                result = self.client.write(
-                    transmitter.address, parameter, str(request["value"]))
+                result = self.client.write(transmitter.address, parameter, request.value)
             finally:
                 self._invalidate_parameters()
             return {
@@ -157,14 +148,11 @@ class ElrsConfigService:
                 "old_value": result.old_value,
                 "parameter": parameter_dict(result.parameter),
             }
-        if command == "command":
-            try:
-                parameter = self.client.command_step(
-                    transmitter.address, parameter, command_step_from_request(request))
-            finally:
-                self._invalidate_parameters()
-            return {"protocol": "elrs", "parameter": parameter_dict(parameter)}
-        raise ValueError(f"unknown configuration command {request['command']!r}")
+        try:
+            parameter = self.client.command_step(transmitter.address, parameter, request.step)
+        finally:
+            self._invalidate_parameters()
+        return {"protocol": "elrs", "parameter": parameter_dict(parameter)}
 
 
 ELRS_RADIO = RadioBackend(

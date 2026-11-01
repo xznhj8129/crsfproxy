@@ -23,10 +23,13 @@ import threading
 import time
 from collections import OrderedDict, deque
 from dataclasses import dataclass, field
+from enum import Enum, auto
 
 import serial
 
 from . import envelope
+from .config import ControlErrorCode, ControlReply, ControlRequest
+from .transport import ProxyConfigTransport
 from .crsf_protocol import (
     CRSF_CHANNEL_PAYLOAD_SIZE,
     FrameParser,
@@ -44,16 +47,13 @@ RAW_QUEUE_SIZE = 64
 STATUS_POLL_INTERVAL_S = 1.0
 U32_MASK = 0xFFFFFFFF
 
-ERROR_BAD_REQUEST = "bad_request"
-ERROR_BUSY = "busy"
-ERROR_FAILED = "failed"
-ERROR_STALE = "stale"
-
-RC_ACCEPTED = "accepted"
-RC_STALE = "stale"
-RC_FOREIGN = "foreign"
-
 Peer = tuple[str, int]
+
+
+class RcResult(Enum):
+    ACCEPTED = auto()
+    STALE = auto()
+    FOREIGN = auto()
 
 
 @dataclass(frozen=True)
@@ -77,7 +77,7 @@ class ProxyOptions:
 @dataclass
 class _ControlState:
     high_water: int | None = None
-    cache: OrderedDict[int, tuple[float, dict]] = field(default_factory=OrderedDict)
+    cache: OrderedDict[int, tuple[float, ControlReply]] = field(default_factory=OrderedDict)
 
 
 class ControlSessions:
@@ -97,7 +97,7 @@ class ControlSessions:
         self.capacity = capacity
         self._states: dict[tuple[Peer, int], _ControlState] = {}
 
-    def cached(self, peer: Peer, session: int, seq: int, now: float) -> dict | None:
+    def cached(self, peer: Peer, session: int, seq: int, now: float) -> ControlReply | None:
         state = self._states.get((peer, session))
         if state is None:
             return None
@@ -116,7 +116,7 @@ class ControlSessions:
             return True
         return envelope.is_newer(seq, state.high_water)
 
-    def complete(self, peer: Peer, session: int, seq: int, reply: dict, now: float) -> None:
+    def complete(self, peer: Peer, session: int, seq: int, reply: ControlReply, now: float) -> None:
         key = (peer, session)
         state = self._states.get(key)
         if state is None:
@@ -189,17 +189,17 @@ class RcOwner:
         seq: int,
         frame: bytes,
         now: float,
-    ) -> str:
+    ) -> RcResult:
         key = (peer, session)
         if self._owner is not None:
             if key != self._owner:
-                return RC_FOREIGN
+                return RcResult.FOREIGN
             if self._last_seq is not None and not envelope.is_newer(seq, self._last_seq):
-                return RC_STALE
+                return RcResult.STALE
         elif (self._released_owner == key
               and self._released_seq is not None
               and not envelope.is_newer(seq, self._released_seq)):
-            return RC_STALE
+            return RcResult.STALE
 
         self._owner = key
         self._released_owner = None
@@ -208,7 +208,7 @@ class RcOwner:
         self._last_seq = seq
         self._last_session = session
         self._last_at = now
-        return RC_ACCEPTED
+        return RcResult.ACCEPTED
 
     def release_if_stale(self, now: float) -> bool:
         if self._owner is None or self._last_at is None:
@@ -226,52 +226,40 @@ class ControlJob:
     peer: Peer
     session: int
     seq: int
-    request: dict
+    request: ControlRequest
 
 
 @dataclass(frozen=True)
 class ControlDone:
     job: ControlJob
-    reply: dict
+    reply: ControlReply
 
 
-def _error_reply(code: str, error: Exception | str) -> dict:
-    message = error if isinstance(error, str) else f"{type(error).__name__}: {error}"
-    return {"ok": False, "error": {"code": code, "message": message}}
-
-
-def _reply_payload(reply: dict) -> bytes:
-    return json.dumps(reply, separators=(",", ":")).encode("utf-8")
-
-
-def _fit_reply(reply: dict) -> dict:
-    """Return reply, or a failed reply if it cannot fit in one datagram."""
+def _reply_payload(reply: ControlReply) -> bytes:
+    """The datagram payload, or a failed reply if it cannot be serialized or fit."""
     try:
-        payload = _reply_payload(reply)
+        payload = json.dumps(reply.to_json(), separators=(",", ":")).encode("utf-8")
     except (TypeError, ValueError, OverflowError, RecursionError) as error:
-        return _error_reply(ERROR_FAILED, f"reply could not be serialized: {error}")
+        return _reply_payload(ControlReply.failure(
+            ControlErrorCode.FAILED, f"reply could not be serialized: {error}"))
     if envelope.HEADER_SIZE + len(payload) > envelope.MAX_DATAGRAM:
-        return _error_reply(
-            ERROR_FAILED,
-            f"reply length={envelope.HEADER_SIZE + len(payload)} "
-            f"exceeds {envelope.MAX_DATAGRAM}",
-        )
-    return reply
+        return _reply_payload(ControlReply.failure(
+            ControlErrorCode.FAILED,
+            f"reply length={envelope.HEADER_SIZE + len(payload)} exceeds {envelope.MAX_DATAGRAM}"))
+    return payload
 
 
-def _cacheable_reply(reply: dict) -> bool:
-    """Only a completed success or failure is cached and advances the high-water mark."""
-    error = reply.get("error")
-    code = error.get("code") if isinstance(error, dict) else None
-    return reply.get("ok") is True or code == ERROR_FAILED
+# Only a completed success or failure is cached and advances the high-water mark.
+CACHEABLE_ERROR_CODES = frozenset({None, ControlErrorCode.FAILED})
 
 
 class ControlWorker(threading.Thread):
     """Execute CONTROL requests one at a time, off the UDP/serial loop."""
 
-    def __init__(self, service: ConfigService) -> None:
+    def __init__(self, service: ConfigService, transport: ProxyConfigTransport) -> None:
         super().__init__(name="control-worker", daemon=True)
         self.service = service
+        self.transport = transport
         self.jobs: queue.Queue[ControlJob | None] = queue.Queue()
         self.done: queue.Queue[ControlDone] = queue.Queue()
         self._stopping = threading.Event()
@@ -297,17 +285,20 @@ class ControlWorker(threading.Thread):
                 return
             self.done.put(ControlDone(job, self._execute(job)))
 
-    def _execute(self, job: ControlJob) -> dict:
+    def _execute(self, job: ControlJob) -> ControlReply:
+        self.transport.begin_operation()
         try:
             result = self.service.execute(job.request)
-        except (KeyError, ValueError) as error:
-            return _fit_reply(_error_reply(ERROR_BAD_REQUEST, error))
-        except Exception as error:  # TimeoutError, RuntimeError, and service failures
-            return _fit_reply(_error_reply(ERROR_FAILED, error))
-        return _fit_reply({"ok": True, "result": result})
+        except (KeyError, ValueError) as error:  # unknown parameter, invalid value
+            return ControlReply.failure(ControlErrorCode.BAD_REQUEST, error)
+        except Exception as error:  # TimeoutError, RuntimeError, device failures
+            return ControlReply.failure(ControlErrorCode.FAILED, error)
+        finally:
+            self.transport.end_operation()
+        return ControlReply(result=result)
 
 
-def _parse_control_request(payload: bytes) -> dict:
+def _parse_control_request(payload: bytes) -> ControlRequest:
     try:
         text = payload.decode("utf-8")
     except UnicodeDecodeError as error:
@@ -320,10 +311,7 @@ def _parse_control_request(payload: bytes) -> dict:
         raise ValueError("CONTROL payload is nested too deeply") from error
     if not isinstance(request, dict):
         raise ValueError("CONTROL payload is not a JSON object")
-    command = request.get("command")
-    if not isinstance(command, str):
-        raise ValueError("CONTROL request has no string command")
-    return request
+    return ControlRequest.from_json(request)
 
 
 def _send_control_reply(
@@ -331,25 +319,22 @@ def _send_control_reply(
     peer: Peer,
     session: int,
     seq: int,
-    reply: dict,
+    reply: ControlReply,
     debug: bool,
 ) -> None:
-    reply = _fit_reply(reply)
     try:
         data = envelope.encode(
             envelope.Kind.CONTROL_REPLY, session, seq, _reply_payload(reply))
         udp_socket.sendto(data, peer)
-    except (OSError, TypeError, ValueError) as error:
+    except (OSError, ValueError) as error:
         print(
             f"CONTROL_REPLY send failed peer={peer} session={session} "
             f"seq={seq} err={error}")
         return
     if debug:
-        error = reply.get("error")
-        code = error.get("code") if isinstance(error, dict) else None
         print(
             f"CONTROL reply peer={peer} session={session} seq={seq} "
-            f"ok={reply.get('ok')} code={code}")
+            f"ok={reply.ok} code={reply.error_code}")
 
 
 def _send_datagram(udp_socket: socket.socket, data: bytes, destination: Peer) -> None:
@@ -417,7 +402,7 @@ def run_proxy(options: ProxyOptions, radio: RadioBackend) -> None:
         frame_parser = FrameParser(radio.frame_addresses)
         config_transport = radio.transport_type()
         service = radio.service_type(config_transport)
-        worker = ControlWorker(service)
+        worker = ControlWorker(service, config_transport)
 
         server_session = envelope.new_session()
         crsf_seq = 0
@@ -495,13 +480,13 @@ def run_proxy(options: ProxyOptions, radio: RadioBackend) -> None:
                         was_owner = owner.owner
                         result = owner.accept(
                             peer, message.session, message.seq, raw, now)
-                        if result == RC_ACCEPTED:
+                        if result == RcResult.ACCEPTED:
                             rc_accepted = (rc_accepted + 1) & U32_MASK
                             if options.debug and owner.owner != was_owner:
                                 print(
                                     f"RC owner peer={peer} "
                                     f"session={message.session} seq={message.seq}")
-                        elif result == RC_STALE:
+                        elif result == RcResult.STALE:
                             rc_stale = (rc_stale + 1) & U32_MASK
                             if options.debug:
                                 print(
@@ -561,8 +546,8 @@ def run_proxy(options: ProxyOptions, radio: RadioBackend) -> None:
                 if not sessions.is_new(peer, message.session, message.seq):
                     _send_control_reply(
                         udp_socket, peer, message.session, message.seq,
-                        _error_reply(
-                            ERROR_STALE,
+                        ControlReply.failure(
+                            ControlErrorCode.STALE,
                             "request seq is older than a completed request"),
                         options.debug)
                     continue
@@ -571,13 +556,13 @@ def run_proxy(options: ProxyOptions, radio: RadioBackend) -> None:
                 except ValueError as error:
                     _send_control_reply(
                         udp_socket, peer, message.session, message.seq,
-                        _error_reply(ERROR_BAD_REQUEST, error),
+                        ControlReply.failure(ControlErrorCode.BAD_REQUEST, error),
                         options.debug)
                     continue
                 if running is not None:
                     _send_control_reply(
                         udp_socket, peer, message.session, message.seq,
-                        _error_reply(ERROR_BUSY, "another CONTROL request is running"),
+                        ControlReply.failure(ControlErrorCode.BUSY, "another CONTROL request is running"),
                         options.debug)
                     continue
 
@@ -587,7 +572,7 @@ def run_proxy(options: ProxyOptions, radio: RadioBackend) -> None:
                 if options.debug:
                     print(
                         f"CONTROL request peer={peer} session={message.session} "
-                        f"seq={message.seq} command={request.get('command')!r}")
+                        f"seq={message.seq} command={request.command.value}")
 
             # Read the device with a zero-timeout block read. pyserial's
             # socket:// reports in_waiting as 1 for any readable socket, so
@@ -656,7 +641,7 @@ def run_proxy(options: ProxyOptions, radio: RadioBackend) -> None:
                 except queue.Empty:
                     break
                 reply = done.reply
-                if _cacheable_reply(reply):
+                if reply.error_code in CACHEABLE_ERROR_CODES:
                     sessions.complete(
                         done.job.peer, done.job.session, done.job.seq,
                         reply, now)

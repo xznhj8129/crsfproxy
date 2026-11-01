@@ -284,7 +284,7 @@ class MlrsConfigTransport(transport.ProxyConfigTransport):
 
     def observe(self, frame: Frame) -> None:
         if frame.type == MLRS_CRSF_TO_RADIO:
-            self.inbound.put(frame)
+            self.deliver(frame)
 
     def snapshot(self) -> dict:
         return {"radio_rate_hz": None, "binding": None}
@@ -786,17 +786,8 @@ class MlrsConfigService:
             result["rx_device"] = summary.rx.as_dict(summary.info.parameter_count)
         return result
 
-    @staticmethod
-    def _offset(request: dict) -> int:
-        try:
-            return int(request.get("offset", 0))
-        except (TypeError, ValueError) as error:
-            raise ValueError(f"offset={request.get('offset')!r} must be an integer") from error
-
-    def _params(self, request: dict) -> dict:
-        offset = self._offset(request)
-        if offset < 0:
-            raise ValueError(f"offset={offset} must be >= 0")
+    def _params(self, request: config.ControlRequest) -> dict:
+        offset = request.offset
         records = self.client.read_all(force=(offset == 0), include_commands=True)
         summary = self.client.request_info()
         page, more = config.paginate(
@@ -836,27 +827,26 @@ class MlrsConfigService:
             "mlrs": self._mlrs_dict(summary),
         }
 
-    def execute(self, request: dict) -> dict:
-        command = request["command"].casefold()
-
-        if command == "devices":
+    def execute(self, request: config.ControlRequest) -> dict:
+        command = request.command
+        if command == config.ControlCommand.DEVICES:
             summary = self.client.request_info(force=True)
             devices = [self._device(summary)]
             if summary.rx is not None:
                 devices.append(summary.rx.as_dict(summary.info.parameter_count))
             return {"protocol": "mlrs", "devices": devices}
 
-        if command == "params":
+        if command == config.ControlCommand.PARAMS:
             return self._params(request)
-        if command == "info":
+        if command == config.ControlCommand.INFO:
             return self._info()
 
-        record = self.client.find(str(request["parameter"]))
-        if command == "get":
+        record = self.client.find(request.parameter)
+        if command == config.ControlCommand.GET:
             return {"protocol": "mlrs", "parameter": self._record_dict(record)}
-        if command == "set":
+        if command == config.ControlCommand.SET:
             try:
-                result = self.client.write(record, str(request["value"]))
+                result = self.client.write(record, request.value)
             finally:
                 self.client.parameter_cache = None
                 self.client.summary = None
@@ -868,18 +858,15 @@ class MlrsConfigService:
                 "persisted": False,
                 "note": "Run command Save to persist mLRS parameter changes",
             }
-        if command == "command":
-            try:
-                parameter = self.client.command_step(
-                    record, config.command_step_from_request(request))
-            finally:
-                self.client.parameter_cache = None
-                self.client.summary = None
-            return {
-                "protocol": "mlrs",
-                "parameter": self._record_dict(replace(record, parameter=parameter)),
-            }
-        raise ValueError(f"unknown configuration command {request['command']!r}")
+        try:
+            parameter = self.client.command_step(record, request.step)
+        finally:
+            self.client.parameter_cache = None
+            self.client.summary = None
+        return {
+            "protocol": "mlrs",
+            "parameter": self._record_dict(replace(record, parameter=parameter)),
+        }
 
 
 MLRS_RADIO = RadioBackend(

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
+from enum import StrEnum
 from typing import TypeVar
 
 from .crsf_protocol import (
@@ -66,14 +68,122 @@ def device_dict(device: DeviceInfo) -> dict:
     }
 
 
-def command_step_from_request(request: dict) -> CommandStatus:
-    """The COMMAND step named in a "command" request ("start", "poll", "confirm", "cancel")."""
-    name = str(request["step"])
-    step = CommandStatus.__members__.get(name.upper())
-    if step not in COMMAND_STEPS:
-        raise ValueError(f"command step={name!r} expected one of "
-                         f"{sorted(s.name.lower() for s in COMMAND_STEPS)}")
-    return step
+class ControlCommand(StrEnum):
+    """CONTROL request commands (PROTOCOL.md)."""
+    DEVICES = "devices"
+    INFO = "info"
+    PARAMS = "params"
+    GET = "get"
+    SET = "set"
+    COMMAND = "command"
+
+
+class ControlErrorCode(StrEnum):
+    """CONTROL_REPLY error codes (PROTOCOL.md)."""
+    BAD_REQUEST = "bad_request"
+    BUSY = "busy"
+    FAILED = "failed"
+    STALE = "stale"
+
+
+PARAMETER_COMMANDS = frozenset({ControlCommand.GET, ControlCommand.SET, ControlCommand.COMMAND})
+
+
+@dataclass(frozen=True)
+class ControlRequest:
+    """One parsed CONTROL request. JSON exists only at the network edge."""
+    command: ControlCommand
+    parameter: str | None = None
+    value: str | None = None
+    step: CommandStatus | None = None
+    offset: int = 0
+
+    @classmethod
+    def from_json(cls, data: dict) -> ControlRequest:
+        """Validate a decoded request object; raises ValueError naming the problem."""
+        try:
+            command = ControlCommand(str(data.get("command", "")).casefold())
+        except ValueError as error:
+            raise ValueError(f"unknown command {data.get('command')!r}; expected one of "
+                             f"{[c.value for c in ControlCommand]}") from error
+        parameter = None
+        if command in PARAMETER_COMMANDS:
+            if data.get("parameter") is None:
+                raise ValueError(f"command={command.value} requires parameter")
+            parameter = str(data["parameter"])
+        value = None
+        if command == ControlCommand.SET:
+            if data.get("value") is None:
+                raise ValueError("command=set requires value")
+            value = str(data["value"])
+        step = None
+        if command == ControlCommand.COMMAND:
+            name = str(data.get("step", ""))
+            step = CommandStatus.__members__.get(name.upper())
+            if step not in COMMAND_STEPS:
+                raise ValueError(f"command step={name!r} expected one of "
+                                 f"{sorted(s.name.lower() for s in COMMAND_STEPS)}")
+        offset = 0
+        if command == ControlCommand.PARAMS:
+            try:
+                offset = int(data.get("offset", 0))
+            except (TypeError, ValueError) as error:
+                raise ValueError(f"offset={data.get('offset')!r} must be an integer") from error
+            if offset < 0:
+                raise ValueError(f"offset={offset} must be >= 0")
+        return cls(command, parameter, value, step, offset)
+
+    def to_json(self) -> dict:
+        data: dict = {"command": self.command.value}
+        if self.parameter is not None:
+            data["parameter"] = self.parameter
+        if self.value is not None:
+            data["value"] = self.value
+        if self.step is not None:
+            data["step"] = self.step.name.lower()
+        if self.command == ControlCommand.PARAMS:
+            data["offset"] = self.offset
+        return data
+
+
+@dataclass(frozen=True)
+class ControlReply:
+    """One CONTROL_REPLY: a JSON-ready result, or an error code and message."""
+    result: dict | None = None
+    error_code: ControlErrorCode | None = None
+    message: str = ""
+
+    @classmethod
+    def failure(cls, code: ControlErrorCode, error: Exception | str) -> ControlReply:
+        message = error if isinstance(error, str) else f"{type(error).__name__}: {error}"
+        return cls(error_code=code, message=message)
+
+    @property
+    def ok(self) -> bool:
+        return self.error_code is None
+
+    def to_json(self) -> dict:
+        if self.ok:
+            return {"ok": True, "result": self.result}
+        return {"ok": False, "error": {"code": self.error_code.value, "message": self.message}}
+
+    @classmethod
+    def from_json(cls, data: dict) -> ControlReply:
+        if not isinstance(data, dict):
+            raise ValueError("CONTROL_REPLY payload is not a JSON object")
+        if data.get("ok") is True:
+            result = data.get("result")
+            return cls(result=result if isinstance(result, dict) else {})
+        error = data.get("error")
+        if not isinstance(error, dict):
+            return cls(error_code=ControlErrorCode.FAILED, message=str(error))
+        message = str(error.get("message", ""))
+        try:
+            code = ControlErrorCode(str(error.get("code")))
+        except ValueError:
+            code = ControlErrorCode.FAILED
+            message = f"unknown error code {error.get('code')!r}: {message}"
+        return cls(error_code=code, message=message)
 
 
 def paginate(

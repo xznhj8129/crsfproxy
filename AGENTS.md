@@ -94,16 +94,19 @@ python3 config_client.py --port 60000 info
   `RF Band=915MHz`, `100Hz Full(-112dBm)`, `Switch Mode=16ch Rate/2`,
   `Link Mode=MAVLink`, `Telem Ratio=1:2`, `TX Power (25mW)`, `Max Power=25`,
   `Dynamic=Off`, `Model Match=Off`.
-- RC is CRSF; the TX `Link Mode` (Normal/MAVLink) is independent of the RC
-  channel path. The FC's serial RX provider must be CRSF. In the 2026-11-01
-  test, the FC provider set to MAVLink did not carry RC; switching it to CRSF
-  made RC work with the TX link mode unchanged.
+- crsfproxy always sends CRSF RC to the TX; `Link Mode` changes only the RX
+  side. With `Link Mode=MAVLink` the RX switches its FC output to MAVLink at
+  460800 and sends RC as `RC_CHANNELS_OVERRIDE` (ExpressLRS `rx_main.cpp`,
+  `SerialMavlink.cpp`), so the FC needs receiver MAVLINK and the RX UART set to
+  MAVLink telemetry at 460800 with Serial RX off. CRSF provider only fits
+  `Link Mode=Normal`. Verified 2026-11-01: stock INAV 9.1, UART6 MAVLink 460800,
+  crsfproxy on `/dev/ttyUSB0`; FC roll followed a 1100–1900 sweep. An RX left in
+  WiFi mode passes no RC.
 - v0.4 hardware check (2026-11-01): `/dev/ttyUSB0` at **115200**; RM Nomad
   X-Band + 900 MHz RX on an INAV FC at `/dev/ttyACM0`; `RF Band=915MHz`,
   `Packet Rate=100Hz Full`, `Max Power=25`. `config_client
   info/params/get/set` worked; `set "Model Match" "Off"` (same value) returned
-  `verified=1`; RC worked, including Ch5 low, with the FC serial RX provider
-  set to CRSF. TX link LQ reached 100.
+  `verified=1`. TX link LQ reached 100.
 - 400000 and 921600 are valid handset bauds. 400000 is the most forgiving for
   configuration; 921600 exposes high packet rates. If the module is already
   locked to 115200, changing the proxy baud requires a TX power cycle.
@@ -157,7 +160,6 @@ python3 config_client.py --port 60000 info
 - Do not expect 921600 config discovery to work immediately after a bridge
   boot; keep RC flowing and retry after the handset link settles.
 - Do not confuse handset `packets_good/bad` with RF `Bad/Good`.
-- Do not set the FC serial RX provider to MAVLink for CRSF RC; use CRSF.
 - Do not claim hardware verification from a unit-test-only result.
 - Do not edit the ESP32-P4 firmware from this repository; the bridge is a
   separate project. Coordinate the `socket://` byte-stream contract with it.

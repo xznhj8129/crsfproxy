@@ -18,8 +18,10 @@ import json
 import socket
 import sys
 import time
+from enum import StrEnum
 
 from lib import envelope
+from lib.config import ControlCommand, ControlErrorCode, ControlReply, ControlRequest
 from lib.crsf_protocol import CommandStatus
 
 
@@ -33,10 +35,16 @@ WRITABLE_TYPES = {"UINT8", "INT8", "UINT16", "INT16", "UINT32", "INT32",
                   "UINT64", "INT64", "FLOAT", "SELECTION"}
 
 
-class ControlError(RuntimeError):
-    """A CONTROL request failed or timed out."""
+class ClientErrorCode(StrEnum):
+    """Failures detected by this client rather than reported by the server."""
+    TIMEOUT = "timeout"
+    BAD_REPLY = "bad_reply"
 
-    def __init__(self, code: str, message: str) -> None:
+
+class ControlError(RuntimeError):
+    """A CONTROL request failed (server ControlErrorCode) or timed out (ClientErrorCode)."""
+
+    def __init__(self, code: ControlErrorCode | ClientErrorCode, message: str) -> None:
         super().__init__(message)
         self.code = code
         self.message = message
@@ -69,7 +77,7 @@ class ControlClient:
             self._closed = True
             self._socket.close()
 
-    def request(self, request: dict, timeout: float | None = None) -> dict:
+    def request(self, request: ControlRequest, timeout: float | None = None) -> dict:
         """Send one request, retrying the same datagram, and return its result."""
         if self._closed:
             raise ValueError("ControlClient is closed")
@@ -77,7 +85,7 @@ class ControlClient:
         if effective_timeout <= 0:
             raise ValueError(f"timeout={effective_timeout} must be positive")
         seq = self.seq
-        payload = json.dumps(request, separators=(",", ":")).encode("utf-8")
+        payload = json.dumps(request.to_json(), separators=(",", ":")).encode("utf-8")
         datagram = envelope.encode(
             envelope.Kind.CONTROL, self.session, seq, payload)
         deadline = time.monotonic() + effective_timeout
@@ -91,7 +99,7 @@ class ControlClient:
                 message = f"no CONTROL_REPLY within {effective_timeout:g}s"
                 if last_socket_error:
                     message += f" (last socket error: {last_socket_error})"
-                raise ControlError("timeout", message)
+                raise ControlError(ClientErrorCode.TIMEOUT, message)
             if now >= retry_at:
                 try:
                     self._socket.send(datagram)
@@ -118,27 +126,16 @@ class ControlClient:
                     or message.seq != seq):
                 continue
             try:
-                reply = json.loads(message.payload)
-                if not isinstance(reply, dict):
-                    raise ValueError("CONTROL_REPLY payload is not a JSON object")
+                reply = ControlReply.from_json(json.loads(message.payload))
             except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
                 self.seq = (seq + 1) & 0xFFFFFFFF
-                raise ControlError("bad_reply", str(error)) from error
-            if reply.get("ok") is True:
-                self.seq = (seq + 1) & 0xFFFFFFFF
-                result = reply.get("result")
-                return result if isinstance(result, dict) else {}
-            error = reply.get("error")
-            if isinstance(error, dict):
-                code = str(error.get("code", "failed"))
-                error_message = str(error.get("message", ""))
-            else:
-                code = "failed"
-                error_message = str(error)
-            if code == "busy":
+                raise ControlError(ClientErrorCode.BAD_REPLY, str(error)) from error
+            if reply.error_code == ControlErrorCode.BUSY:
                 continue
             self.seq = (seq + 1) & 0xFFFFFFFF
-            raise ControlError(code, error_message)
+            if reply.ok:
+                return reply.result
+            raise ControlError(reply.error_code, reply.message)
 
 
 def fetch_all_params(client: ControlClient) -> dict:
@@ -147,10 +144,10 @@ def fetch_all_params(client: ControlClient) -> dict:
     combined: dict = {}
     offset = 0
     while True:
-        page = client.request({"command": "params", "offset": offset})
+        page = client.request(ControlRequest(ControlCommand.PARAMS, offset=offset))
         page_parameters = page.get("parameters")
         if not isinstance(page_parameters, list):
-            raise ControlError("bad_reply", "params reply has no parameters list")
+            raise ControlError(ClientErrorCode.BAD_REPLY, "params reply has no parameters list")
         for key, value in page.items():
             if key not in ("parameters", "offset", "total", "more"):
                 combined[key] = value
@@ -163,7 +160,7 @@ def fetch_all_params(client: ControlClient) -> dict:
             return combined
         if not page_parameters:
             raise ControlError(
-                "bad_reply",
+                ClientErrorCode.BAD_REPLY,
                 f"params page offset={offset} more=1 but returned no parameters")
         offset += len(page_parameters)
 
@@ -171,11 +168,9 @@ def fetch_all_params(client: ControlClient) -> dict:
 def command_request(client: ControlClient, parameter: str,
                     step: CommandStatus, timeout: float | None = None) -> dict:
     """Send one COMMAND step (crsf_protocol.COMMAND_STEPS); returns the parameter's new state."""
-    return client.request({
-        "command": "command",
-        "parameter": parameter,
-        "step": step.name.lower(),
-    }, timeout)["parameter"]
+    return client.request(
+        ControlRequest(ControlCommand.COMMAND, parameter=parameter, step=step),
+        timeout)["parameter"]
 
 
 def poll_delay_s(state: dict) -> float:
@@ -391,19 +386,17 @@ def run_tui(screen, client: ControlClient, timeout: float) -> None:
                 # shown on the status line; the TUI keeps running.
                 try:
                     if parameter["type"] == "SELECTION":
-                        full_parameter = client.request({
-                            "command": "get",
-                            "parameter": str(parameter["id"]),
-                        }, timeout)["parameter"]
+                        full_parameter = client.request(
+                            ControlRequest(ControlCommand.GET, parameter=str(parameter["id"])),
+                            timeout)["parameter"]
                         value = choose_option(screen, full_parameter)
                         if value is None:
                             status = f"edit {parameter['name']!r} cancelled"
                             continue
-                        response = client.request({
-                            "command": "set",
-                            "parameter": str(parameter["id"]),
-                            "value": value,
-                        }, timeout)
+                        response = client.request(
+                            ControlRequest(ControlCommand.SET, parameter=str(parameter["id"]),
+                                           value=value),
+                            timeout)
                         status = (
                             f"{parameter['name']}={response['parameter']['value']!r} "
                             f"verified={int(response['verified'])}"
@@ -411,11 +404,10 @@ def run_tui(screen, client: ControlClient, timeout: float) -> None:
                         break
                     if parameter["type"] in WRITABLE_TYPES:
                         value = prompt_value(screen, parameter)
-                        response = client.request({
-                            "command": "set",
-                            "parameter": str(parameter["id"]),
-                            "value": value,
-                        }, timeout)
+                        response = client.request(
+                            ControlRequest(ControlCommand.SET, parameter=str(parameter["id"]),
+                                           value=value),
+                            timeout)
                         status = (
                             f"{parameter['name']}={response['parameter']['value']!r} "
                             f"verified={int(response['verified'])}"
@@ -438,7 +430,7 @@ def run_command_cli(client: ControlClient, timeout: float, name_or_id: str,
     stdin (or answered yes by --confirm), progress is printed on one line,
     and Ctrl-C sends CANCEL before exiting.
     """
-    target = str(client.request({"command": "get", "parameter": name_or_id}, timeout)
+    target = str(client.request(ControlRequest(ControlCommand.GET, parameter=name_or_id), timeout)
                  ["parameter"]["id"])
     try:
         state = command_request(client, target, CommandStatus.START, timeout)
@@ -503,11 +495,9 @@ def main() -> int:
         if args.command == "params":
             result = fetch_all_params(client)
         else:
-            request = {"command": args.command}
-            if hasattr(args, "parameter"):
-                request["parameter"] = args.parameter
-            if hasattr(args, "value"):
-                request["value"] = args.value
+            request = ControlRequest(ControlCommand(args.command),
+                                     parameter=getattr(args, "parameter", None),
+                                     value=getattr(args, "value", None))
             result = client.request(request, args.timeout)
         if args.json:
             print(json.dumps(result, indent=2))

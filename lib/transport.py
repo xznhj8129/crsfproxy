@@ -32,6 +32,30 @@ class ProxyConfigTransport:
         self.state_lock = threading.Lock()
         self.radio_rate_hz = None
         self.status = None
+        # Device replies are only queued while a CONTROL operation runs, so an
+        # operation never reads replies meant for an earlier operation or for
+        # another configurator (e.g. a radio's elrs.lua through the RC owner).
+        self._accepting = False
+        self.dropped = 0
+
+    def begin_operation(self) -> None:
+        self.poll()
+        self._accepting = True
+
+    def end_operation(self) -> None:
+        self._accepting = False
+        self.poll()
+
+    def deliver(self, frame: CrsfFrame) -> None:
+        """Queue a device reply for the running operation."""
+        if not self._accepting:
+            return
+        try:
+            self.inbound.put_nowait(frame)
+        except queue.Full:
+            self.dropped += 1
+            print(f"Config reply dropped type=0x{frame.type:02X} len={len(frame.raw)} "
+                  f"queue_size={self.INBOUND_QUEUE_SIZE} dropped_total={self.dropped}")
 
     def origin(self, device_address: int) -> int:
         if device_address == CRSF_ADDRESS_TRANSMITTER:
@@ -83,10 +107,7 @@ class ProxyConfigTransport:
                 FrameType.DEVICE_INFO,
                 FrameType.PARAMETER_SETTINGS_ENTRY,
                 FrameType.PARAMETER_WRITE):
-            try:
-                self.inbound.put_nowait(frame)
-            except queue.Full:
-                pass
+            self.deliver(frame)
 
     def snapshot(self) -> dict:
         with self.state_lock:
