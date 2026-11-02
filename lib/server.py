@@ -355,15 +355,15 @@ def _age_ms(timestamp: float | None, now: float) -> int:
 def run_proxy(options: ProxyOptions, radio: RadioBackend) -> None:
     loop_period = 1.0 / options.loop_hz
 
-    print(f"Listening for protocol v1 UDP on {options.host}:{options.port}")
+    print(f"Listening for UDP on {options.host}:{options.port}")
     print(
-        f"{radio.name} device={options.device} baud={options.baud} "
-        f"tx_rate={options.tx_rate} loop_hz={options.loop_hz}")
+        f"{radio.name} on {options.device} at {options.baud} baud, "
+        f"{options.tx_rate:g} Hz max")
     print(
         "RC hold disabled" if options.rc_hold_ms == 0
         else f"RC hold {options.rc_hold_ms} ms")
-    print(f"Telemetry envelope destinations: {options.telemetry or 'none'}")
-    print(f"Telemetry raw destinations: {options.telemetry_raw or 'none'}")
+    print(f"Telemetry to: {', '.join(options.telemetry) or 'none'}")
+    print(f"Raw telemetry to: {', '.join(options.telemetry_raw) or 'none'}")
 
     serial_port = None
     udp_socket = None

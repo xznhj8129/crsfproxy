@@ -27,6 +27,9 @@ from __future__ import annotations
 
 import argparse
 import socket
+import sys
+
+import serial
 
 from lib.elrs_backend import ELRS_RADIO
 from lib.mlrs_backend import MLRS_RADIO
@@ -57,9 +60,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--radio", choices=RADIOS, default=DEFAULT_RADIO,
                         help="Radio configuration backend")
     parser.add_argument("--host", default="0.0.0.0",
-                        help="UDP bind host for the protocol v1 port")
+                        help="UDP bind address")
     parser.add_argument("--port", type=int, default=60000,
-                        help="the one UDP protocol port")
+                        help="UDP port")
     parser.add_argument("--device", default="/dev/ttyUSB0",
                         help="Serial device or pySerial URL, e.g. socket://127.0.0.1:5762")
     parser.add_argument("--baud", type=int,
@@ -98,23 +101,27 @@ def main() -> int:
         parser.error("--status_hz must be > 0")
 
     radio = RADIOS[args.radio]
-    run_proxy(
-        ProxyOptions(
-            host=args.host,
-            port=args.port,
-            device=args.device,
-            baud=radio.default_baud if args.baud is None else args.baud,
-            tx_rate=args.tx_rate,
-            loop_hz=args.loop_hz,
-            rc_hold_ms=args.rc_hold_ms,
-            telemetry=tuple(args.telemetry or ()),
-            telemetry_raw=tuple(args.telemetry_raw or ()),
-            rc_owner_timeout_ms=args.rc_owner_timeout_ms,
-            status_hz=args.status_hz,
-            debug=args.debug,
-        ),
-        radio,
-    )
+    try:
+        run_proxy(
+            ProxyOptions(
+                host=args.host,
+                port=args.port,
+                device=args.device,
+                baud=radio.default_baud if args.baud is None else args.baud,
+                tx_rate=args.tx_rate,
+                loop_hz=args.loop_hz,
+                rc_hold_ms=args.rc_hold_ms,
+                telemetry=tuple(args.telemetry or ()),
+                telemetry_raw=tuple(args.telemetry_raw or ()),
+                rc_owner_timeout_ms=args.rc_owner_timeout_ms,
+                status_hz=args.status_hz,
+                debug=args.debug,
+            ),
+            radio,
+        )
+    except (serial.SerialException, OSError) as error:
+        print(f"cannot start: {error}", file=sys.stderr)
+        return 1
     return 0
 
 

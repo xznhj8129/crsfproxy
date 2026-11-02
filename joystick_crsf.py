@@ -105,8 +105,9 @@ def _option_value(argv: list[str], index: int, name: str) -> tuple[str, int]:
 
 def parse_target_specs(argv: list[str]) -> tuple[list[tuple[str, int]], list[str]]:
     """Extract ordered target/port pairs and leave global options for argparse."""
-    targets: list[list[object]] = []
-    current = None
+    targets: list[list[object]] = [["127.0.0.1", DEFAULT_PORT]]
+    current = targets[0]
+    explicit = False
     remaining: list[str] = []
     index = 0
 
@@ -115,6 +116,9 @@ def parse_target_specs(argv: list[str]) -> tuple[list[tuple[str, int]], list[str
         if arg == "--target" or arg.startswith("--target="):
             value, index = _option_value(argv, index, "--target")
             host, port = parse_target(value)
+            if not explicit:
+                targets.clear()
+                explicit = True
             current = [host, port]
             targets.append(current)
             continue
@@ -135,9 +139,6 @@ def parse_target_specs(argv: list[str]) -> tuple[list[tuple[str, int]], list[str
         remaining.append(arg)
         index += 1
 
-    if not targets:
-        raise ValueError("at least one --target is required")
-
     return [(str(host), int(port)) for host, port in targets], remaining
 
 
@@ -145,7 +146,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--target", action="append", metavar="HOST[:PORT]",
-                        help="UDP proxy target; repeat for multiple proxies")
+                        help="UDP proxy target, default 127.0.0.1:60000; "
+                             "repeat for multiple proxies")
     parser.add_argument("--port", type=int, metavar="PORT",
                         help="Port for the most recent --target (default 60000)")
     parser.add_argument("--rate", type=float, default=DEFAULT_RATE_HZ,
@@ -190,7 +192,7 @@ def main() -> None:
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     session = envelope.new_session()
     seq = 0
-    print("Sending protocol v1 RC to " + ", ".join(f"{host}:{port}" for host, port in targets) + ".")
+    print("Sending RC to " + ", ".join(f"{host}:{port}" for host, port in targets) + ".")
 
     channels = [MID_US] * CRSF_CHANNEL_COUNT
     channels[2] = MIN_US
