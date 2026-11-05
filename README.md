@@ -248,7 +248,7 @@ python3 crsfproxy.py --device /dev/ttyUSB0 --port 60010
 
 Configuration only depends on the parts of CRSF that are fixed by the spec: the frame codec and the read/write/command exchange. The settings themselves are read from the module, so new, renamed or reordered settings in another ELRS release need no changes here. What *would* need a code change is a change to the protocol itself, like a new parameter type. That's rare, and it's why the README names the version that has actually been tested rather than claiming everything. If your version reads and writes correctly, it works.
 
-**Upgrading from v0.3:** v0.4 changed the wire format. Configuration now shares the RC port instead of using port + 1, RC is a real CRSF frame instead of the old 40-byte packet, `--telemetry_udp` became `--telemetry_raw`, and a single RC owner is enforced. Old v0.3 clients won't talk to v0.4. v0.4 also fixes reading from `socket://` devices. The details are in [PROTOCOL.md](PROTOCOL.md#changes-from-v03).
+**Upgrading from v0.3:** v0.4 changed the wire format. Configuration now shares the RC port instead of using port + 1, RC is a real CRSF frame instead of the old 40-byte packet, `--telemetry_udp` became `--telemetry_raw`, and a single RC owner is enforced. Old v0.3 clients won't talk to v0.4. v0.4 also fixes reading from `socket://` devices, and configuration can address other devices such as the receiver (`--address`, TUI **Other Devices**). The details are in [PROTOCOL.md](PROTOCOL.md#changes-from-v03).
 
 ## 🗂️ Repository layout
 

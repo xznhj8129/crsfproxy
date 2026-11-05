@@ -450,3 +450,4 @@ What the device does next is outside this protocol.
 | raw telemetry to one `--telemetry_udp` address | `--telemetry` (envelope) and `--telemetry_raw` (bare), both repeatable |
 | "one RC source" was a usage rule | RC owner, enforced |
 | — | STATUS |
+| config talks to the TX only | CONTROL `address`: `params`/`get`/`set`/`command` on another device, e.g. the receiver |
