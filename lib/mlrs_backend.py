@@ -836,6 +836,10 @@ class MlrsConfigService:
                 devices.append(summary.rx.as_dict(summary.info.parameter_count))
             return {"protocol": "mlrs", "devices": devices}
 
+        if request.address not in (None, CRSF_ADDRESS_TRANSMITTER):
+            raise ValueError(
+                f"address=0x{request.address:02X}: mLRS has one parameter table, on the "
+                f"transmitter (0x{CRSF_ADDRESS_TRANSMITTER:02X}), receiver settings included")
         if command == config.ControlCommand.PARAMS:
             return self._params(request)
         if command == config.ControlCommand.INFO:

@@ -100,7 +100,7 @@ A browser for the module's settings, in your terminal:
 | <kbd>r</kbd> | Reload |
 | <kbd>Esc</kbd> during a command | Cancel it |
 
-Every write is read back to make sure it took. Commands like Bind or WiFi update work the way they do in `elrs.lua`: the module's own confirmation prompt, then its progress, for as long as it runs.
+Every write is read back to make sure it took. Commands like Bind or WiFi update work the way they do in `elrs.lua`: the module's own confirmation prompt, then its progress, for as long as it runs. **Other Devices** at the top level switches to another device, such as the receiver.
 
 For scripts:
 
@@ -110,6 +110,7 @@ python3 config_client.py params                  # the full settings table
 python3 config_client.py get "Packet Rate"
 python3 config_client.py set "Packet Rate" "333Hz Full(-105dBm)"
 python3 config_client.py command Bind --confirm
+python3 config_client.py --address 0xEC params   # another device's table, e.g. the receiver
 ```
 
 Keep RC running while you configure. The module answers much more reliably with traffic on its handset port.

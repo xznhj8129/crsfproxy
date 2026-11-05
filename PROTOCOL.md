@@ -153,6 +153,15 @@ A request to the server itself. The payload is a UTF-8 JSON object with a
   - For a selection: the option text or its decimal index.
   - Otherwise: a decimal number.
 - `S` is one of `start`, `confirm`, `cancel`, `poll`.
+- `A` is an optional `address` on `params`, `get`, `set`, and `command`: the
+  decimal CRSF address of a device from `devices`.
+  - Absent means the transmitter (`0xEE`).
+  - `info` and `devices` ignore it.
+  - An address nobody answered is `bad_request`.
+  - mLRS accepts only `0xEE`; its receiver settings are in the transmitter's table.
+  - ELRS requests to a device other than the TX resend every 5 s and time out
+    after 10 s per chunk, because they cross the air link.
+  - It is an additive field: the protocol stays v1.
 
 **`params` pagination**
 

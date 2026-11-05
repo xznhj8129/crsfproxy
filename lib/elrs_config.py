@@ -12,6 +12,7 @@ from dataclasses import dataclass
 
 from .crsf_protocol import (
     CRSF_ADDRESS_BROADCAST,
+    CRSF_ADDRESS_TRANSMITTER,
     COMMAND_STEPS,
     CommandStatus,
     DeviceInfo,
@@ -24,6 +25,13 @@ from .crsf_protocol import (
     make_extended_frame,
     parse_device_info,
 )
+
+
+RESEND_S = 0.5
+# elrs.lua fieldTimeout for a device other than the TX module: its replies
+# cross the air link, and the TX queues every request it is given.
+REMOTE_RESEND_S = 5.0
+REMOTE_TIMEOUT_S = 10.0
 
 
 @dataclass(frozen=True)
@@ -74,17 +82,24 @@ class ParameterClient:
             time.sleep(0.002)
         return devices
 
+    def _timing(self, device_address: int) -> tuple[float, float]:
+        """(resend interval, per-chunk timeout) for a device."""
+        if device_address == CRSF_ADDRESS_TRANSMITTER:
+            return RESEND_S, self.timeout_seconds
+        return REMOTE_RESEND_S, REMOTE_TIMEOUT_S
+
     def _read_chunks(self, device_address: int, parameter_id: int,
                      query_type: int, query_value: int | None = None,
                      first_value: int | None = None) -> bytes:
         """first_value, when given, replaces the value of the very first query only
         (a COMMAND step, sent once); resends and later chunks use query_value."""
         origin = self.transport.origin(device_address)
+        resend_s, timeout_s = self._timing(device_address)
         chunk = 0
         remaining = None
         assembled = bytearray()
         while True:
-            deadline = time.monotonic() + self.timeout_seconds
+            deadline = time.monotonic() + timeout_s
             frame = None
             attempts = 0
             while frame is None and time.monotonic() < deadline:
@@ -95,7 +110,7 @@ class ParameterClient:
                 self.transport.queue(make_extended_frame(
                     query_type, device_address, origin, bytes([parameter_id, value])))
                 frame = self._pump(
-                    min(deadline, time.monotonic() + 0.5),
+                    min(deadline, time.monotonic() + resend_s),
                     lambda f: f.type == FrameType.PARAMETER_SETTINGS_ENTRY
                     and f.origin == device_address and f.extended_payload[0] == parameter_id
                     and (remaining is None or f.extended_payload[1] == remaining - 1),
@@ -103,7 +118,7 @@ class ParameterClient:
             if frame is None:
                 raise TimeoutError(
                     f"device=0x{device_address:02X} parameter_id={parameter_id} "
-                    f"chunk={chunk} attempts={attempts} timeout_seconds={self.timeout_seconds}")
+                    f"chunk={chunk} attempts={attempts} timeout_seconds={timeout_s}")
             response = frame.extended_payload
             assembled.extend(response[2:])
             remaining = response[1]

@@ -206,10 +206,18 @@ class ControlRequestTests(unittest.TestCase):
             {"command": "command", "parameter": "Bind", "step": "start"})
         self.assertEqual(ControlRequest.from_json(request.to_json()), request)
 
+    def test_address_round_trip(self) -> None:
+        request = ControlRequest.from_json({"command": "get", "parameter": "x", "address": 0xEC})
+        self.assertEqual(request.address, 0xEC)
+        self.assertEqual(ControlRequest.from_json(request.to_json()), request)
+        self.assertIsNone(ControlRequest.from_json({"command": "info", "address": 0xEC}).address)
+
     def test_invalid_requests(self) -> None:
         for data in ({"command": "nope"}, {"command": "get"}, {"command": "set", "parameter": "x"},
                      {"command": "command", "parameter": "Bind", "step": "go"},
-                     {"command": "params", "offset": -1}):
+                     {"command": "params", "offset": -1},
+                     {"command": "params", "address": 256},
+                     {"command": "params", "address": "rx"}):
             with self.assertRaises(ValueError):
                 ControlRequest.from_json(data)
 

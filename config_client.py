@@ -21,8 +21,9 @@ import time
 from enum import StrEnum
 
 from lib import envelope
-from lib.config import ControlCommand, ControlErrorCode, ControlReply, ControlRequest
-from lib.crsf_protocol import CommandStatus
+from lib.config import (
+    ADDRESSED_COMMANDS, ControlCommand, ControlErrorCode, ControlReply, ControlRequest)
+from lib.crsf_protocol import CRSF_ADDRESS_TRANSMITTER, CommandStatus
 
 
 DEFAULT_HOST = "127.0.0.1"
@@ -33,6 +34,9 @@ UDP_RESPONSE_LIMIT = 65507
 SPINNER = "|/-\\"
 WRITABLE_TYPES = {"UINT8", "INT8", "UINT16", "INT16", "UINT32", "INT32",
                   "UINT64", "INT64", "FLOAT", "SELECTION"}
+# The synthetic root row that opens the device picker (elrs.lua's Other Devices).
+OTHER_DEVICES = {"id": 0, "parent": 0, "type": "FOLDER", "hidden": False,
+                 "name": "Other Devices", "value": "", "raw_value": 0}
 
 
 class ClientErrorCode(StrEnum):
@@ -138,13 +142,25 @@ class ControlClient:
             raise ControlError(reply.error_code, reply.message)
 
 
-def fetch_all_params(client: ControlClient) -> dict:
+def device_is_transmitter(address: int | None) -> bool:
+    """True for the transmitter: no address at all, or its own 0xEE."""
+    return address is None or address == CRSF_ADDRESS_TRANSMITTER
+
+
+def other_devices(devices: list[dict], current_address: int | None) -> list[dict]:
+    """The devices a picker may switch to: every one except the current device."""
+    current = CRSF_ADDRESS_TRANSMITTER if current_address is None else current_address
+    return [device for device in devices if device.get("address") != current]
+
+
+def fetch_all_params(client: ControlClient, address: int | None = None) -> dict:
     """Fetch every compact parameter page and return one combined result."""
     parameters: list[dict] = []
     combined: dict = {}
     offset = 0
     while True:
-        page = client.request(ControlRequest(ControlCommand.PARAMS, offset=offset))
+        page = client.request(
+            ControlRequest(ControlCommand.PARAMS, offset=offset, address=address))
         page_parameters = page.get("parameters")
         if not isinstance(page_parameters, list):
             raise ControlError(ClientErrorCode.BAD_REPLY, "params reply has no parameters list")
@@ -165,11 +181,13 @@ def fetch_all_params(client: ControlClient) -> dict:
         offset += len(page_parameters)
 
 
-def command_request(client: ControlClient, parameter: str,
-                    step: CommandStatus, timeout: float | None = None) -> dict:
+def command_request(client: ControlClient, parameter: str, step: CommandStatus,
+                    timeout: float | None = None,
+                    address: int | None = None) -> dict:
     """Send one COMMAND step (crsf_protocol.COMMAND_STEPS); returns the parameter's new state."""
     return client.request(
-        ControlRequest(ControlCommand.COMMAND, parameter=parameter, step=step),
+        ControlRequest(ControlCommand.COMMAND, parameter=parameter, step=step,
+                       address=address),
         timeout)["parameter"]
 
 
@@ -276,7 +294,8 @@ def draw_popup(screen, lines: list[str]) -> None:
     screen.refresh()
 
 
-def run_command_popup(screen, client: ControlClient, timeout: float, parameter: dict) -> str:
+def run_command_popup(screen, client: ControlClient, timeout: float, parameter: dict,
+                      address: int | None = None) -> str:
     """Run a COMMAND like elrs.lua's popup; returns the status-line text.
 
     Shows the device's own confirmation text and progress info, polls every
@@ -287,13 +306,13 @@ def run_command_popup(screen, client: ControlClient, timeout: float, parameter: 
     target = str(parameter["id"])
     cancelled = False
     spin = 0
-    state = command_request(client, target, CommandStatus.START, timeout)
+    state = command_request(client, target, CommandStatus.START, timeout, address)
     while state["command_status"] != CommandStatus.READY:
         if state["command_status"] == CommandStatus.CONFIRMATION_NEEDED:
             draw_popup(screen, [name, state["command_info"], "", "[y] confirm   [any other key] cancel"])
             step = CommandStatus.CONFIRM if screen.getch() in (ord("y"), ord("Y")) else CommandStatus.CANCEL
             cancelled = step == CommandStatus.CANCEL
-            state = command_request(client, target, step, timeout)
+            state = command_request(client, target, step, timeout, address)
             continue
         draw_popup(screen, [name, f"{state['command_info']} [{SPINNER[spin % len(SPINNER)]}]", "",
                             "[Esc] cancel"])
@@ -303,30 +322,75 @@ def run_command_popup(screen, client: ControlClient, timeout: float, parameter: 
         screen.timeout(-1)
         if key in (27, curses.KEY_LEFT):
             cancelled = True
-            state = command_request(client, target, CommandStatus.CANCEL, timeout)
+            state = command_request(client, target, CommandStatus.CANCEL, timeout, address)
         else:
-            state = command_request(client, target, CommandStatus.POLL, timeout)
+            state = command_request(client, target, CommandStatus.POLL, timeout, address)
     if cancelled:
         return f"command {name!r} cancelled"
     info = state["command_info"].strip()
     return f"command {name!r} finished" + (f": {info}" if info else "")
 
 
-def run_tui(screen, client: ControlClient, timeout: float) -> None:
+def choose_device(screen, devices: list[dict]) -> int | None:
+    """Pick one device from a `devices` reply; returns its address or None."""
+    selected = 0
+    while True:
+        screen.erase()
+        screen.addnstr(
+            0, 0, "Other Devices — Up/Down select, Right/Enter switch, Left/Escape back",
+            screen.getmaxyx()[1] - 1, curses.A_BOLD)
+        height, width = screen.getmaxyx()
+        top = max(0, selected - height + 3)
+        for row, device in enumerate(devices[top:top + height - 2], 1):
+            index = top + row - 1
+            marker = "> " if index == selected else "  "
+            line = (f"{marker}0x{device['address']:02X} {device['name']:<24.24} "
+                    f"{device['version']}")
+            screen.addnstr(row, 0, line, width - 1,
+                           curses.A_REVERSE if index == selected else curses.A_NORMAL)
+        key = screen.getch()
+        if key in (curses.KEY_LEFT, 27):
+            return None
+        if key == curses.KEY_UP:
+            selected = (selected - 1) % len(devices)
+        if key == curses.KEY_DOWN:
+            selected = (selected + 1) % len(devices)
+        if key in (curses.KEY_RIGHT, curses.KEY_ENTER, 10, 13):
+            return devices[selected]["address"]
+
+
+def run_tui(screen, client: ControlClient, timeout: float,
+            address: int | None = None) -> None:
     curses.curs_set(0)
     curses.set_escdelay(25)
     selected = 0
     status = ""
     parent_stack = [0]
+    current_address = address
     while True:
-        result = fetch_all_params(client)
+        try:
+            result = fetch_all_params(client, current_address)
+        except ControlError as error:
+            # A device chosen from Other Devices can stop answering; elrs.lua
+            # falls back to the transmitter, and so does the TUI.
+            if device_is_transmitter(current_address):
+                raise
+            status = (f"device 0x{current_address:02X} failed: "
+                      f"{error.code}: {error.message}")
+            current_address = None
+            parent_stack = [0]
+            selected = 0
+            continue
         all_parameters = result["parameters"]
         while True:
             parameters = [
                 parameter for parameter in all_parameters
                 if not parameter["hidden"] and parameter["parent"] == parent_stack[-1]
             ]
-            selected = min(selected, len(parameters) - 1)
+            rows = parameters
+            if parent_stack[-1] == 0:
+                rows = parameters + [OTHER_DEVICES]
+            selected = min(selected, len(rows) - 1)
             screen.erase()
             height, width = screen.getmaxyx()
             folder_name = result["device"]["name"]
@@ -350,7 +414,7 @@ def run_tui(screen, client: ControlClient, timeout: float) -> None:
                 )
             screen.addnstr(1, 0, banner, width - 1, curses.A_BOLD)
             top = max(0, selected - height + 5)
-            for row, parameter in enumerate(parameters[top:top + height - 4], 2):
+            for row, parameter in enumerate(rows[top:top + height - 4], 2):
                 index = top + row - 2
                 value = parameter["value"]
                 if parameter["type"] == "COMMAND":
@@ -363,20 +427,47 @@ def run_tui(screen, client: ControlClient, timeout: float) -> None:
             screen.addnstr(height - 1, 0, status, width - 1)
             key = screen.getch()
             if key in (curses.KEY_LEFT, 27):
-                if len(parent_stack) == 1:
+                if len(parent_stack) > 1:
+                    parent_stack.pop()
+                    selected = 0
+                    status = ""
+                    continue
+                if device_is_transmitter(current_address):
                     return
-                parent_stack.pop()
+                # At the root of another device, back returns to the transmitter.
+                current_address = None
+                parent_stack = [0]
                 selected = 0
                 status = ""
-                continue
-            if key == curses.KEY_UP:
-                selected = (selected - 1) % len(parameters)
-            if key == curses.KEY_DOWN:
-                selected = (selected + 1) % len(parameters)
+                break
+            if key == curses.KEY_UP and rows:
+                selected = (selected - 1) % len(rows)
+            if key == curses.KEY_DOWN and rows:
+                selected = (selected + 1) % len(rows)
             if key == ord("r"):
                 break
-            if key in (curses.KEY_RIGHT, curses.KEY_ENTER, 10, 13):
-                parameter = parameters[selected]
+            if key in (curses.KEY_RIGHT, curses.KEY_ENTER, 10, 13) and rows:
+                parameter = rows[selected]
+                if parameter is OTHER_DEVICES:
+                    try:
+                        devices = client.request(
+                            ControlRequest(ControlCommand.DEVICES), timeout)["devices"]
+                    except ControlError as error:
+                        status = f"devices failed: {error.code}: {error.message}"
+                        continue
+                    choices = other_devices(devices, current_address)
+                    if not choices:
+                        status = "no other devices"
+                        continue
+                    chosen = choose_device(screen, choices)
+                    if chosen is None:
+                        status = "device switch cancelled"
+                        continue
+                    current_address = chosen
+                    parent_stack = [0]
+                    selected = 0
+                    status = ""
+                    break
                 if parameter["type"] == "FOLDER":
                     parent_stack.append(parameter["id"])
                     selected = 0
@@ -387,7 +478,8 @@ def run_tui(screen, client: ControlClient, timeout: float) -> None:
                 try:
                     if parameter["type"] == "SELECTION":
                         full_parameter = client.request(
-                            ControlRequest(ControlCommand.GET, parameter=str(parameter["id"])),
+                            ControlRequest(ControlCommand.GET, parameter=str(parameter["id"]),
+                                           address=current_address),
                             timeout)["parameter"]
                         value = choose_option(screen, full_parameter)
                         if value is None:
@@ -395,7 +487,7 @@ def run_tui(screen, client: ControlClient, timeout: float) -> None:
                             continue
                         response = client.request(
                             ControlRequest(ControlCommand.SET, parameter=str(parameter["id"]),
-                                           value=value),
+                                           value=value, address=current_address),
                             timeout)
                         status = (
                             f"{parameter['name']}={response['parameter']['value']!r} "
@@ -406,7 +498,7 @@ def run_tui(screen, client: ControlClient, timeout: float) -> None:
                         value = prompt_value(screen, parameter)
                         response = client.request(
                             ControlRequest(ControlCommand.SET, parameter=str(parameter["id"]),
-                                           value=value),
+                                           value=value, address=current_address),
                             timeout)
                         status = (
                             f"{parameter['name']}={response['parameter']['value']!r} "
@@ -414,7 +506,8 @@ def run_tui(screen, client: ControlClient, timeout: float) -> None:
                         )
                         break
                     if parameter["type"] == "COMMAND":
-                        status = run_command_popup(screen, client, timeout, parameter)
+                        status = run_command_popup(
+                            screen, client, timeout, parameter, current_address)
                         break
                 except ControlError as error:
                     status = f"{parameter['name']!r} failed: {error.code}: {error.message}"
@@ -423,17 +516,18 @@ def run_tui(screen, client: ControlClient, timeout: float) -> None:
 
 
 def run_command_cli(client: ControlClient, timeout: float, name_or_id: str,
-                    assume_yes: bool) -> tuple[dict, int]:
+                    assume_yes: bool, address: int | None = None) -> tuple[dict, int]:
     """Run a COMMAND from the shell; returns (final state, exit code).
 
     Same loop as the TUI popup: the device's confirmation text is asked on
     stdin (or answered yes by --confirm), progress is printed on one line,
     and Ctrl-C sends CANCEL before exiting.
     """
-    target = str(client.request(ControlRequest(ControlCommand.GET, parameter=name_or_id), timeout)
-                 ["parameter"]["id"])
+    target = str(client.request(
+        ControlRequest(ControlCommand.GET, parameter=name_or_id, address=address), timeout)
+        ["parameter"]["id"])
     try:
-        state = command_request(client, target, CommandStatus.START, timeout)
+        state = command_request(client, target, CommandStatus.START, timeout, address)
         while state["command_status"] != CommandStatus.READY:
             if state["command_status"] == CommandStatus.CONFIRMATION_NEEDED:
                 if assume_yes:
@@ -444,17 +538,40 @@ def run_command_cli(client: ControlClient, timeout: float, name_or_id: str,
                     except EOFError:
                         answer = ""
                 if answer.strip().casefold() != "y":
-                    return command_request(client, target, CommandStatus.CANCEL, timeout), 1
-                state = command_request(client, target, CommandStatus.CONFIRM, timeout)
+                    return command_request(
+                        client, target, CommandStatus.CANCEL, timeout, address), 1
+                state = command_request(
+                    client, target, CommandStatus.CONFIRM, timeout, address)
                 continue
             print(f"\r{state['command_info']} (Ctrl-C to cancel)", end="", flush=True)
             time.sleep(poll_delay_s(state))
-            state = command_request(client, target, CommandStatus.POLL, timeout)
+            state = command_request(client, target, CommandStatus.POLL, timeout, address)
     except KeyboardInterrupt:
         print()
-        return command_request(client, target, CommandStatus.CANCEL, timeout), 130
+        return command_request(client, target, CommandStatus.CANCEL, timeout, address), 130
     print()
     return state, 0
+
+
+def cli_control_request(command: ControlCommand, address: int | None,
+                        parameter: str | None = None,
+                        value: str | None = None) -> ControlRequest:
+    """One CLI request; only the commands that address a device carry its address."""
+    return ControlRequest(
+        command, parameter=parameter, value=value,
+        address=address if command in ADDRESSED_COMMANDS else None)
+
+
+def address_type(text: str) -> int:
+    """Parse a CRSF device address: 0xEC or 236."""
+    try:
+        value = int(text, 0)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(
+            f"{text!r} is not a decimal or 0x-prefixed address") from error
+    if not 0 <= value <= 0xFF:
+        raise argparse.ArgumentTypeError(f"{value} is not in 0..255")
+    return value
 
 
 def main() -> int:
@@ -463,6 +580,9 @@ def main() -> int:
     parser.add_argument("--host", default=DEFAULT_HOST)
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_S)
+    parser.add_argument("--address", type=address_type, metavar="A",
+                        help="device address from devices, hex or decimal (0xEC or 236); "
+                             "default is the transmitter")
     parser.add_argument("--json", action="store_true")
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("info")
@@ -483,21 +603,22 @@ def main() -> int:
     client = ControlClient(args.host, args.port, args.timeout)
     try:
         if args.command == "tui":
-            curses.wrapper(run_tui, client, args.timeout)
+            curses.wrapper(run_tui, client, args.timeout, args.address)
             return 0
         if args.command == "command":
-            state, code = run_command_cli(client, args.timeout, args.parameter, args.confirm)
+            state, code = run_command_cli(
+                client, args.timeout, args.parameter, args.confirm, args.address)
             print(json.dumps(state, indent=2) if args.json else
                   f"command {state['name']!r} {'finished' if code == 0 else 'cancelled'} "
                   f"status={state['command_status']} info={state['command_info'].strip()!r}")
             return code
 
         if args.command == "params":
-            result = fetch_all_params(client)
+            result = fetch_all_params(client, args.address)
         else:
-            request = ControlRequest(ControlCommand(args.command),
-                                     parameter=getattr(args, "parameter", None),
-                                     value=getattr(args, "value", None))
+            request = cli_control_request(
+                ControlCommand(args.command), args.address,
+                getattr(args, "parameter", None), getattr(args, "value", None))
             result = client.request(request, args.timeout)
         if args.json:
             print(json.dumps(result, indent=2))

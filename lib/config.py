@@ -87,6 +87,8 @@ class ControlErrorCode(StrEnum):
 
 
 PARAMETER_COMMANDS = frozenset({ControlCommand.GET, ControlCommand.SET, ControlCommand.COMMAND})
+# Commands that address one device's parameter table (PROTOCOL.md `address`).
+ADDRESSED_COMMANDS = PARAMETER_COMMANDS | {ControlCommand.PARAMS}
 
 
 @dataclass(frozen=True)
@@ -97,6 +99,7 @@ class ControlRequest:
     value: str | None = None
     step: CommandStatus | None = None
     offset: int = 0
+    address: int | None = None  # CRSF device address; None is the transmitter
 
     @classmethod
     def from_json(cls, data: dict) -> ControlRequest:
@@ -131,7 +134,15 @@ class ControlRequest:
                 raise ValueError(f"offset={data.get('offset')!r} must be an integer") from error
             if offset < 0:
                 raise ValueError(f"offset={offset} must be >= 0")
-        return cls(command, parameter, value, step, offset)
+        address = None
+        if command in ADDRESSED_COMMANDS and data.get("address") is not None:
+            try:
+                address = int(data["address"])
+            except (TypeError, ValueError) as error:
+                raise ValueError(f"address={data['address']!r} must be an integer") from error
+            if not 0 <= address <= 0xFF:
+                raise ValueError(f"address={address} must be 0..255")
+        return cls(command, parameter, value, step, offset, address)
 
     def to_json(self) -> dict:
         data: dict = {"command": self.command.value}
@@ -143,6 +154,8 @@ class ControlRequest:
             data["step"] = self.step.name.lower()
         if self.command == ControlCommand.PARAMS:
             data["offset"] = self.offset
+        if self.address is not None:
+            data["address"] = self.address
         return data
 
 

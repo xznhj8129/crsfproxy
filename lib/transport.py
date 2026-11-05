@@ -103,7 +103,7 @@ class ProxyConfigTransport:
                     "flags": f"0x{data[3]:02X}",
                     "message": message,
                 }
-        if frame.origin == CRSF_ADDRESS_TRANSMITTER and frame.type in (
+        if frame.type in (
                 FrameType.DEVICE_INFO,
                 FrameType.PARAMETER_SETTINGS_ENTRY,
                 FrameType.PARAMETER_WRITE):

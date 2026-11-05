@@ -38,41 +38,48 @@ PARAMETER_CACHE_TTL_S = 30.0
 
 
 class ElrsConfigService:
-    """Execute one-shot Lua-style operations against the ELRS transmitter."""
+    """Execute one-shot Lua-style operations against an ELRS device (the TX by default)."""
 
     def __init__(self, transport: ProxyConfigTransport) -> None:
         self.transport = transport
         self.client = ParameterClient(transport, DEFAULT_PARAMETER_TIMEOUT_S)
-        self.device = None
-        self._parameters: list[Parameter] | None = None
-        self._parameters_at = 0.0
+        self.devices: dict[int, DeviceInfo] = {}
+        # address -> (parameter table, read time)
+        self._tables: dict[int, tuple[list[Parameter], float]] = {}
 
-    def transmitter(self) -> DeviceInfo:
-        if self.device is None:
-            devices = self.client.discover(CONFIG_DEVICE_DISCOVERY_S)
-            self.device = devices[ELRS_ADDRESS_TRANSMITTER]
-        return self.device
+    def _discover(self) -> dict[int, DeviceInfo]:
+        self.devices = self.client.discover(CONFIG_DEVICE_DISCOVERY_S)
+        return self.devices
 
-    def _parameter_table(self, allow_stale: bool = False) -> list[Parameter]:
-        """The transmitted parameter table, read once per cache lifetime.
+    def device(self, address: int | None = None) -> DeviceInfo:
+        """The device at address (None: the transmitter), pinging once if it is not known yet."""
+        address = ELRS_ADDRESS_TRANSMITTER if address is None else address
+        if address not in self.devices:
+            self._discover()
+        if address not in self.devices:
+            raise KeyError(f"no device 0x{address:02X} answered the ping (devices={len(self.devices)})")
+        return self.devices[address]
+
+    def _parameter_table(self, device: DeviceInfo, allow_stale: bool = False) -> list[Parameter]:
+        """The device's parameter table, read once per cache lifetime.
 
         A paginated ``params`` sweep uses allow_stale for offset > 0 so a slow
-        client cannot trigger a full module re-read between pages.
+        client cannot trigger a full device re-read between pages.
         """
-        now = time.monotonic()
-        if (self._parameters is None
+        cached = self._tables.get(device.address)
+        if (cached is None
                 or (not allow_stale
-                    and now - self._parameters_at >= PARAMETER_CACHE_TTL_S)):
-            self._parameters = list(self.client.read_all(self.transmitter()))
-            self._parameters_at = time.monotonic()
-        return self._parameters
+                    and time.monotonic() - cached[1] >= PARAMETER_CACHE_TTL_S)):
+            cached = (list(self.client.read_all(device)), time.monotonic())
+            self._tables[device.address] = cached
+        return cached[0]
 
-    def _invalidate_parameters(self) -> None:
-        self._parameters = None
+    def _invalidate_parameters(self, device: DeviceInfo) -> None:
+        self._tables.pop(device.address, None)
 
-    def _find_parameter(self, name_or_id) -> Parameter:
+    def _find_parameter(self, device: DeviceInfo, name_or_id) -> Parameter:
         text = str(name_or_id)
-        parameters = self._parameter_table()
+        parameters = self._parameter_table(device)
         if text.isdecimal():
             parameter_id = int(text)
             for parameter in parameters:
@@ -82,24 +89,53 @@ class ElrsConfigService:
         for parameter in parameters:
             if parameter.name.casefold() == folded:
                 return parameter
-        raise KeyError(
-            f"parameter {text!r} not found on device 0x{self.transmitter().address:02X}")
+        raise KeyError(f"parameter {text!r} not found on device 0x{device.address:02X}")
+
+    def _info(self) -> dict:
+        """The transmitter summary; info never addresses another device."""
+        transmitter = self.device()
+        parameters = self._parameter_table(transmitter)
+        values = {
+            parameter.name: parameter_value(parameter)
+            for parameter in parameters
+            if parameter.value is not None
+        }
+        firmware_hash = None
+        for name, value in values.items():
+            if "hash" in name.casefold() or "git" in name.casefold():
+                firmware_hash = value
+                break
+        result = {
+            "protocol": "elrs",
+            "device": device_dict(transmitter),
+            "current_band": values.get("RF Band"),
+            "packet_rate": values.get("Packet Rate"),
+            "mode": values.get("Link Mode"),
+            "model_id": values.get("Model Id"),
+            "telemetry_ratio": values.get("Telem Ratio"),
+            "firmware_hash": firmware_hash,
+        }
+        result.update(self.transport.snapshot())
+        return result
 
     def execute(self, request: ControlRequest) -> dict:
         if request.command == ControlCommand.DEVICES:
-            devices = self.client.discover(CONFIG_DEVICE_DISCOVERY_S)
+            devices = self._discover()
             return {
                 "protocol": "elrs",
                 "devices": [device_dict(devices[address]) for address in sorted(devices)],
             }
 
-        transmitter = self.transmitter()
+        if request.command == ControlCommand.INFO:
+            return self._info()
+
+        device = self.device(request.address)
         if request.command == ControlCommand.PARAMS:
-            parameters = self._parameter_table(allow_stale=request.offset > 0)
+            parameters = self._parameter_table(device, allow_stale=request.offset > 0)
             page, more = parameter_page(parameters, request.offset)
             result = {
                 "protocol": "elrs",
-                "device": device_dict(transmitter),
+                "device": device_dict(device),
                 "parameters": page,
                 "offset": request.offset,
                 "total": len(parameters),
@@ -107,41 +143,16 @@ class ElrsConfigService:
             }
             result.update(self.transport.snapshot())
             return result
-        if request.command == ControlCommand.INFO:
-            parameters = self._parameter_table()
-            values = {
-                parameter.name: parameter_value(parameter)
-                for parameter in parameters
-                if parameter.value is not None
-            }
-            firmware_hash = None
-            for name, value in values.items():
-                if "hash" in name.casefold() or "git" in name.casefold():
-                    firmware_hash = value
-                    break
-            result = {
-                "protocol": "elrs",
-                "device": device_dict(transmitter),
-                "current_band": values.get("RF Band"),
-                "packet_rate": values.get("Packet Rate"),
-                "mode": values.get("Link Mode"),
-                "model_id": values.get("Model Id"),
-                "telemetry_ratio": values.get("Telem Ratio"),
-                "firmware_hash": firmware_hash,
-            }
-            result.update(self.transport.snapshot())
-            return result
-
-        parameter = self._find_parameter(request.parameter)
+        parameter = self._find_parameter(device, request.parameter)
         if request.command == ControlCommand.GET:
             # The table only locates the parameter; its value is read live.
-            live = self.client.read(transmitter.address, parameter.id)
+            live = self.client.read(device.address, parameter.id)
             return {"protocol": "elrs", "parameter": parameter_dict(live)}
         if request.command == ControlCommand.SET:
             try:
-                result = self.client.write(transmitter.address, parameter, request.value)
+                result = self.client.write(device.address, parameter, request.value)
             finally:
-                self._invalidate_parameters()
+                self._invalidate_parameters(device)
             return {
                 "protocol": "elrs",
                 "verified": result.verified,
@@ -149,9 +160,9 @@ class ElrsConfigService:
                 "parameter": parameter_dict(result.parameter),
             }
         try:
-            parameter = self.client.command_step(transmitter.address, parameter, request.step)
+            parameter = self.client.command_step(device.address, parameter, request.step)
         finally:
-            self._invalidate_parameters()
+            self._invalidate_parameters(device)
         return {"protocol": "elrs", "parameter": parameter_dict(parameter)}
 
 

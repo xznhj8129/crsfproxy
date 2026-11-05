@@ -20,26 +20,36 @@ def run(service, data: dict) -> dict:
 
 
 class FakeClient:
-    def __init__(self, device, parameters) -> None:
+    def __init__(self, device, parameters, others=None) -> None:
         self.device = device
         self.parameters = list(parameters)
+        # address -> (DeviceInfo, parameters) for devices other than the TX
+        self.others = dict(others or {})
         self.read_all_calls = 0
         self.write_calls = 0
         self.command_calls = 0
 
+    def _parameters(self, device_address):
+        if device_address == self.device.address:
+            return self.parameters
+        return self.others[device_address][1]
+
     def read(self, device_address, parameter_id):
         self.live_reads = getattr(self, "live_reads", 0) + 1
-        for parameter in self.parameters:
+        for parameter in self._parameters(device_address):
             if parameter.id == parameter_id:
                 return parameter
         raise TimeoutError(f"parameter_id={parameter_id}")
 
     def discover(self, seconds):
-        return {self.device.address: self.device}
+        self.discover_calls = getattr(self, "discover_calls", 0) + 1
+        devices = {address: device for address, (device, _) in self.others.items()}
+        devices[self.device.address] = self.device
+        return devices
 
     def read_all(self, device):
         self.read_all_calls += 1
-        return list(self.parameters)
+        return list(self._parameters(device.address))
 
     def write(self, device_address, parameter, value):
         self.write_calls += 1
@@ -94,13 +104,13 @@ def info_parameters() -> list[Parameter]:
     ]
 
 
-def make_service(parameters=None, device=None):
+def make_service(parameters=None, device=None, others=None):
     parameters = list(parameters or [])
     if device is None:
         device = DeviceInfo(0xEE, "RM Nomad", "ELRS", 0, 0x00040102,
                             len(parameters), 0)
     transport = ProxyConfigTransport()
-    client = FakeClient(device, parameters)
+    client = FakeClient(device, parameters, others)
     service = ElrsConfigService(transport)
     service.client = client
     return service, client, transport
@@ -167,7 +177,8 @@ class ElrsConfigServiceTests(unittest.TestCase):
         run(service, {"command": "params", "offset": 0})
         run(service, {"command": "params", "offset": 1})
         self.assertEqual(client.read_all_calls, 1)
-        service._parameters_at = time.monotonic() - PARAMETER_CACHE_TTL_S - 1
+        table, _ = service._tables[0xEE]
+        service._tables[0xEE] = (table, time.monotonic() - PARAMETER_CACHE_TTL_S - 1)
         run(service, {"command": "params", "offset": 0})
         self.assertEqual(client.read_all_calls, 2)
 
@@ -199,6 +210,27 @@ class ElrsConfigServiceTests(unittest.TestCase):
             run(service, {"command": "get", "parameter": "missing"})
         with self.assertRaises((KeyError, ValueError)):
             run(service, {"command": "get", "parameter": "999"})
+
+    def test_address_selects_the_device_table(self) -> None:
+        receiver_parameters = [Parameter(1, 0, ParameterType.SELECTION, False, "Rx Power",
+                                         value=1, options=("Low", "High"))]
+        receiver = DeviceInfo(0xEC, "HM ES900RX", "ELRS", 0, 0x00040000, 1, 0)
+        service, client, _ = make_service(
+            info_parameters(), others={0xEC: (receiver, receiver_parameters)})
+        result = run(service, {"command": "params", "address": 0xEC})
+        self.assertEqual(result["device"]["address"], 0xEC)
+        self.assertEqual([p["name"] for p in result["parameters"]], ["Rx Power"])
+        self.assertEqual(run(service, {"command": "get", "parameter": "Rx Power",
+                                       "address": 0xEC})["parameter"]["value"], "High")
+        run(service, {"command": "set", "parameter": "Rx Power", "value": "Low", "address": 0xEC})
+        self.assertNotIn(0xEC, service._tables)
+        self.assertEqual(run(service, {"command": "params"})["device"]["address"], 0xEE)
+        self.assertEqual(client.discover_calls, 1)
+
+    def test_unknown_address_is_a_key_error(self) -> None:
+        service, client, _ = make_service(info_parameters())
+        with self.assertRaisesRegex(KeyError, "no device 0xEC answered the ping"):
+            run(service, {"command": "params", "address": 0xEC})
 
     def test_set_invalidates_parameter_cache(self) -> None:
         service, client, _ = make_service(selection_parameters(30))
@@ -248,6 +280,14 @@ class ConfigTransportTests(unittest.TestCase):
         self.assertAlmostEqual(snapshot["radio_rate_hz"], 333.0003, places=3)
         self.assertTrue(snapshot["binding"]["connected"])
         self.assertEqual(snapshot["binding"]["packets_good"], 9)
+
+    def test_transport_delivers_config_replies_from_every_device(self) -> None:
+        transport = ProxyConfigTransport()
+        transport.begin_operation()
+        for origin in (0xEE, 0xEC):
+            payload = bytes([0xEA, origin]) + b"dev\x00" + bytes(14)
+            transport.observe(CrsfFrame(0xC8, FrameType.DEVICE_INFO, payload, b""))
+        self.assertEqual([f.origin for f in transport.poll()], [0xEE, 0xEC])
 
 
 if __name__ == "__main__":
