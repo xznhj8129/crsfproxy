@@ -16,10 +16,11 @@ MAX_DATAGRAM = 65507
 
 HEADER_STRUCT = struct.Struct("<BBII")
 HEADER_SIZE = HEADER_STRUCT.size
-STATUS_STRUCT = struct.Struct("<7I")
+STATUS_STRUCT = struct.Struct("<7IBBHI")
 STATUS_SIZE = STATUS_STRUCT.size
+STATUS_SIZE_V03 = struct.Struct("<7I").size
 
-# rc_age_ms / device_rx_age_ms sentinel: nothing since start.
+# rc_age_ms / device_rx_age_ms / link_age_ms sentinel: nothing since start.
 STATUS_NO_VALUE = 0xFFFFFFFF
 
 
@@ -87,7 +88,7 @@ def is_newer(a: int, b: int) -> bool:
 
 @dataclass(frozen=True)
 class Status:
-    """The 28-byte STATUS payload."""
+    """The 36-byte STATUS payload (28-byte v0.3 payloads also unpack)."""
 
     rc_age_ms: int = STATUS_NO_VALUE
     rc_session: int = 0
@@ -96,9 +97,13 @@ class Status:
     rc_stale: int = 0
     rc_foreign: int = 0
     device_rx_age_ms: int = STATUS_NO_VALUE
+    link_flags: int | None = 0
+    link_pkts_bad: int | None = 0
+    link_pkts_good: int | None = 0
+    link_age_ms: int | None = STATUS_NO_VALUE
 
     def pack(self) -> bytes:
-        fields = (
+        u32_fields = (
             ("rc_age_ms", self.rc_age_ms),
             ("rc_session", self.rc_session),
             ("rc_seq", self.rc_seq),
@@ -107,13 +112,29 @@ class Status:
             ("rc_foreign", self.rc_foreign),
             ("device_rx_age_ms", self.device_rx_age_ms),
         )
-        for name, value in fields:
+        for name, value in u32_fields:
             if not 0 <= value <= 0xFFFFFFFF:
                 raise ValueError(f"status.{name}={value} out of u32 range")
-        return STATUS_STRUCT.pack(*(value for _, value in fields))
+        link_fields = (
+            ("link_flags", self.link_flags if self.link_flags is not None else 0, 0xFF),
+            ("link_pkts_bad", self.link_pkts_bad if self.link_pkts_bad is not None else 0, 0xFF),
+            ("link_pkts_good", self.link_pkts_good if self.link_pkts_good is not None else 0, 0xFFFF),
+            ("link_age_ms", self.link_age_ms if self.link_age_ms is not None else STATUS_NO_VALUE, 0xFFFFFFFF),
+        )
+        for name, value, limit in link_fields:
+            if not 0 <= value <= limit:
+                raise ValueError(f"status.{name}={value} out of range")
+        return STATUS_STRUCT.pack(
+            *(value for _, value in u32_fields),
+            *(value for _, value, _ in link_fields),
+        )
 
     @classmethod
     def unpack(cls, data: bytes) -> Status:
+        if len(data) == STATUS_SIZE_V03:
+            values = struct.unpack("<7I", data)
+            return cls(*values, link_flags=None, link_pkts_bad=None,
+                       link_pkts_good=None, link_age_ms=None)
         if len(data) != STATUS_SIZE:
             raise ValueError(f"status length={len(data)} expected={STATUS_SIZE}")
         return cls(*STATUS_STRUCT.unpack(data))

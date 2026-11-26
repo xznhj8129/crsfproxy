@@ -1,2 +1,8 @@
 __pycache__/
 *.log
+.venv/
+.vscode/
+.claude/
+.agents/
+.codex/
+.pytest_cache/

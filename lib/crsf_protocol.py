@@ -313,6 +313,32 @@ def encode_parameter_value(parameter: Parameter, value: str) -> bytes:
     raise ValueError(f"parameter={parameter.name!r} type={parameter.type.name} writable=0")
 
 
+def parse_elrs_status(frame: Frame) -> dict | None:
+    """Parse an extended ELRS_STATUS (0x2E) frame.
+
+    Payload after the extended address bytes: uint8 pktsBad, uint16 pktsGood
+    (big-endian), uint8 flags, null-terminated message.
+    Flags: bit 0 CONNECTED, bit 2 MODEL_MATCH, bit 3 ISARMED.
+    Returns None for non-ELRS_STATUS or short/malformed frames.
+    """
+    if frame.type != FrameType.ELRS_STATUS:
+        return None
+    data = frame.extended_payload
+    if len(data) < 4:
+        return None
+    flags = data[3]
+    message = data[4:].split(b"\x00", 1)[0].decode("utf-8", errors="replace")
+    return {
+        "connected": bool(flags & 0x01),
+        "armed": bool(flags & 0x08),
+        "model_match": bool(flags & 0x04),
+        "pkts_bad": data[0],
+        "pkts_good": int.from_bytes(data[1:3], "big"),
+        "msg": message,
+        "flags": flags,
+    }
+
+
 def describe_frame(frame: Frame) -> str:
     type_name = FrameType(frame.type).name if frame.type in FrameType._value2member_map_ else f"0x{frame.type:02X}"
     if frame.type == FrameType.RC_CHANNELS_PACKED:
@@ -367,12 +393,14 @@ def describe_frame(frame: Frame) -> str:
             f"parameter_version={device.parameter_version}"
         )
     if frame.type == FrameType.ELRS_STATUS:
-        data = frame.extended_payload
-        message = data[4:].split(b"\x00", 1)[0].decode("utf-8", errors="replace")
-        return (
-            f"TEL ELRS_STATUS destination=0x{frame.destination:02X} origin=0x{frame.origin:02X} "
-            f"packets_bad={data[0]} packets_good={int.from_bytes(data[1:3], 'big')} flags=0x{data[3]:02X} message={message!r}"
-        )
+        status = parse_elrs_status(frame)
+        if status is not None:
+            return (
+                f"TEL ELRS_STATUS destination=0x{frame.destination:02X} origin=0x{frame.origin:02X} "
+                f"connected={status['connected']} armed={status['armed']} "
+                f"pkts_bad={status['pkts_bad']} pkts_good={status['pkts_good']} "
+                f"flags=0x{status['flags']:02X} msg={status['msg']!r}"
+            )
     if frame.type == FrameType.RADIO_ID and len(frame.payload) >= 11 and frame.payload[2] == 0x10:
         interval = int.from_bytes(frame.payload[3:7], "big", signed=True)
         shift = int.from_bytes(frame.payload[7:11], "big", signed=True)

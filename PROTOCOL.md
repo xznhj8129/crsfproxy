@@ -71,7 +71,7 @@ Little-endian. A 10-byte header, then the payload.
 | 1 | CRSF | both | exactly one CRSF frame |
 | 2 | CONTROL | client → server | UTF-8 JSON request object |
 | 3 | CONTROL_REPLY | server → requester | UTF-8 JSON reply object |
-| 4 | STATUS | server → destinations | 28-byte status struct |
+| 4 | STATUS | server → destinations | 36-byte status struct |
 
 Other `kind` values are reserved.
 
@@ -245,19 +245,25 @@ A request to the server itself. The payload is a UTF-8 JSON object with a
 
 - Sent to every `--telemetry` destination at `--status_hz`.
 - Sent whether or not anything arrives.
-- Seven u32 LE fields:
+- 36 bytes, little-endian: seven `u32` fields, then `u8`, `u8`, `u16`, `u32` (`<7IBBHI`).
 
-| # | Field | Meaning |
-|---|---|---|
-| 0 | `rc_age_ms` | ms since the last accepted RC frame; `0xFFFFFFFF` if none since start |
-| 1 | `rc_session` | session of that frame; 0 if none |
-| 2 | `rc_seq` | seq of that frame; 0 if none |
-| 3 | `rc_accepted` | RC frames accepted since start |
-| 4 | `rc_stale` | RC frames from the current or last owner dropped because their seq was not newer |
-| 5 | `rc_foreign` | RC frames dropped while an owner was present because they came from a different `(peer, session)` |
-| 6 | `device_rx_age_ms` | ms since the last valid frame from the device; `0xFFFFFFFF` if none |
+| # | Field | Type | Meaning |
+|---|---|---|---|
+| 0 | `rc_age_ms` | u32 | ms since the last accepted RC frame; `0xFFFFFFFF` if none since start |
+| 1 | `rc_session` | u32 | session of that frame; 0 if none |
+| 2 | `rc_seq` | u32 | seq of that frame; 0 if none |
+| 3 | `rc_accepted` | u32 | RC frames accepted since start |
+| 4 | `rc_stale` | u32 | RC frames from the current or last owner dropped because their seq was not newer |
+| 5 | `rc_foreign` | u32 | RC frames dropped while an owner was present because they came from a different `(peer, session)` |
+| 6 | `device_rx_age_ms` | u32 | ms since the last valid frame from the device; `0xFFFFFFFF` if none |
+| 7 | `link_flags` | u8 | raw ELRS status flags from the last valid ELRS_STATUS (0x2E) frame; 0 if none since start |
+| 8 | `link_pkts_bad` | u8 | `pktsBad` from that frame; 0 if none since start |
+| 9 | `link_pkts_good` | u16 | `pktsGood` from that frame (big-endian in the CRSF frame, stored here as a little-endian field value); 0 if none since start |
+| 10 | `link_age_ms` | u32 | ms since that ELRS_STATUS frame was received; `0xFFFFFFFF` if none since start |
 
-- Counters wrap at 2³².
+- `link_flags` bits (ExpressLRS): bit 0 `CONNECTED`, bit 2 `MODEL_MATCH`, bit 3 `ISARMED`. Other bits are reserved.
+- Counters and ages wrap/saturate at 2³² where applicable.
+- Servers always pack the 36-byte form. Older 28-byte STATUS payloads (fields 0–6 only) may still be accepted by clients during rollout. When unpacking a 28-byte payload, the link fields have no value.
 
 ## Server rules
 

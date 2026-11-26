@@ -35,6 +35,7 @@ from .crsf_protocol import (
     FrameParser,
     FrameType,
     describe_frame,
+    parse_elrs_status,
     validate_frame,
 )
 from .radio import ConfigService, RadioBackend
@@ -362,8 +363,11 @@ def run_proxy(options: ProxyOptions, radio: RadioBackend) -> None:
     print(
         "RC hold disabled" if options.rc_hold_ms == 0
         else f"RC hold {options.rc_hold_ms} ms")
-    print(f"Telemetry to: {', '.join(options.telemetry) or 'none'}")
-    print(f"Raw telemetry to: {', '.join(options.telemetry_raw) or 'none'}")
+    telemetry = ", ".join(f"{host}:{port}" for host, port in options.telemetry) or "none"
+    raw_telemetry = (", ".join(f"{host}:{port}" for host, port in options.telemetry_raw)
+                     or "none")
+    print(f"Telemetry to: {telemetry}")
+    print(f"Raw telemetry to: {raw_telemetry}")
 
     serial_port = None
     udp_socket = None
@@ -415,6 +419,8 @@ def run_proxy(options: ProxyOptions, radio: RadioBackend) -> None:
         rc_stale = 0
         rc_foreign = 0
         device_rx_at = None
+        link_status = None
+        link_status_at = None
         raw_frames: deque[bytes] = deque()
 
         last_written_session = None
@@ -611,6 +617,11 @@ def run_proxy(options: ProxyOptions, radio: RadioBackend) -> None:
                     print(
                         f"Device frame observe failed address=0x{frame.address:02X} "
                         f"type=0x{frame.type:02X} len={len(frame.raw)} err={error}")
+                if frame.type == FrameType.ELRS_STATUS:
+                    parsed_link = parse_elrs_status(frame)
+                    if parsed_link is not None:
+                        link_status = parsed_link
+                        link_status_at = now
                 device_rx_at = now
                 if options.debug:
                     try:
@@ -665,6 +676,10 @@ def run_proxy(options: ProxyOptions, radio: RadioBackend) -> None:
                     rc_stale=rc_stale,
                     rc_foreign=rc_foreign,
                     device_rx_age_ms=_age_ms(device_rx_at, now),
+                    link_flags=link_status["flags"] if link_status is not None else 0,
+                    link_pkts_bad=link_status["pkts_bad"] if link_status is not None else 0,
+                    link_pkts_good=link_status["pkts_good"] if link_status is not None else 0,
+                    link_age_ms=_age_ms(link_status_at, now),
                 )
                 payload = status.pack()
                 for destination in options.telemetry:
